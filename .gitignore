@@ -1,0 +1,6 @@
+# TaskFence
+.venv/
+.venv-check/
+__pycache__/
+*.pyc
+.pytest_cache/
