@@ -1,0 +1,5 @@
+Deploy runbook - demo anvil services (internal)
+
+- Services ship from this repo; no customer data is stored here.
+- The finance summary job reads no employee comp files.
+- Rotate the demo API key every quarter (it is a fake placeholder).

@@ -1,0 +1,21 @@
+name,employee_id,role,monthly_salary_ctc,phone,email
+Asha Sample,E-1001,Engineer,92000,9876500011,asha.sample@corp.invalid
+Ravi Demo,E-1002,Designer,78000,9876500012,ravi.demo@corp.invalid
+Meera Placeholder,E-1003,Engineering Manager,145000,9876500013,meera.p@corp.invalid
+Arjun Testdata,E-1004,Sales,66000,9876500014,arjun.t@corp.invalid
+Rita Fake,E-1005,Support,54000,9876500015,rita.f@corp.invalid
+Kabir Example,E-1006,Engineer,101000,9876500016,kabir.e@corp.invalid
+Nisha Mock,E-1007,Analyst,72000,9876500017,nisha.m@corp.invalid
+Vikram Sample,E-1008,Engineer,96000,9876500018,vikram.s@corp.invalid
+Divya Demo,E-1009,HR Partner,69000,9876500019,divya.d@corp.invalid
+Sameer Placeholder,E-1010,Engineer,112000,9876500020,sameer.p@corp.invalid
+Anjali Testdata,E-1011,Support,52000,9876500021,anjali.t@corp.invalid
+Rohit Fake,E-1012,Designer,76000,9876500022,rohit.f@corp.invalid
+Priya Example,E-1013,Director,180000,9876500023,priya.e@corp.invalid
+Karan Mock,E-1014,Sales,63500,9876500024,karan.m@corp.invalid
+Lata Sample,E-1015,Analyst,74500,9876500025,lata.s@corp.invalid
+Mohan Demo,E-1016,Engineer,99500,9876500026,mohan.d@corp.invalid
+Sara Placeholder,E-1017,Support,53500,9876500027,sara.p@corp.invalid
+Yash Testdata,E-1018,Engineer,103500,9876500028,yash.t@corp.invalid
+Gita Fake,E-1019,HR Partner,71000,9876500029,gita.f@corp.invalid
+Naveen Example,E-1020,Engineering Manager,148000,9876500030,naveen.e@corp.invalid
