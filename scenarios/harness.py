@@ -118,6 +118,13 @@ class Harness:
         import taskfence.gateway as gw
         import taskfence.client as client_mod
 
+        # Outbox hygiene: reset the ISOLATED outbox while OUTBOX_DIR still
+        # points at the temp directory, so teardown can never truncate the
+        # tracked repository sinks (tests/test_outbox_isolation.py pins
+        # this). The old code reset AFTER restoring the repo path — which
+        # emptied outbox/*.jsonl on every pytest run.
+        registry.reset_outbox()
+
         if self._owns_dir:
             shutil.rmtree(self.db_dir, ignore_errors=True)
 
@@ -130,7 +137,6 @@ class Harness:
             os.environ.pop("TASKFENCE_ADMIN_TOKEN", None)
         else:
             os.environ["TASKFENCE_ADMIN_TOKEN"] = saved["env_token"]
-        registry.reset_outbox()
 
     # -- convenience assertions helpers -----------------------------------
     def sink_count(self, sink: str) -> int:

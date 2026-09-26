@@ -10,7 +10,10 @@ CTX = {"task_id": "t-tools", "source_asset": "sales_report_q3",
 
 
 @pytest.fixture(autouse=True)
-def _clean_outbox():
+def _clean_outbox(tmp_path, monkeypatch):
+    """Isolated outbox: sink writes and resets never touch the tracked
+    repository outbox/*.jsonl (pinned by tests/test_outbox_isolation.py)."""
+    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
     registry.reset_outbox()
     yield
     registry.reset_outbox()

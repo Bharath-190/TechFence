@@ -35,7 +35,10 @@ def test_poisoned_file_is_present_and_carries_the_injection():
     assert "ignore" in low  # injection marker per spec §39 Phase 6
 
 
-def test_reset_outbox_empties_both_sinks():
+def test_reset_outbox_empties_both_sinks(tmp_path, monkeypatch):
+    """Isolated outbox: the reset behavior is pinned without touching the
+    tracked repository outbox/*.jsonl (tests/test_outbox_isolation.py)."""
+    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
     registry.reset_outbox()
     slack = registry.OUTBOX_DIR / registry.SINKS["slack_sales"]
     external = registry.OUTBOX_DIR / registry.SINKS["external_api"]
