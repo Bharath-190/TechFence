@@ -184,6 +184,12 @@ def main() -> None:
         agent = ScriptedAgent(client)
         for step in agent.run(args.task, args.scripted):
             print(f"{step['tool']}: {step['decision']}")
+            # Same human-facing message the Ollama path prints: on
+            # BLOCK/APPROVE the gateway's agent_message is surfaced instead
+            # of a raw tool result (DECISIONS §7). Wording stays owned by
+            # the gateway — this only re-prints the response field.
+            if step["decision"] in ("BLOCK", "APPROVE"):
+                print(step["agent_message"])
         return
     agent = OllamaAgent(client)
     transcript, final = agent.run(args.task)

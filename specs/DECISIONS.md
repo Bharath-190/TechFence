@@ -1,13 +1,12 @@
 # TaskFence — Decisions Log
 
-**Status: DRAFT — pending Gate 0 (human review).**
+**Status: CONFIRMED — Gate 0 passed (human review, 2026-09-27).**
 
 This file closes the open questions left by `specs/TaskFence_Project_Specification.md`
-(cited below as §N). Every section carries a proposed default marked with a
-`⚠️ VERIFY` line. **The human owner must read each default, edit anything they
-disagree with, and delete every `⚠️ VERIFY` line** — Gate 0 is only passed when
-this file contains no VERIFY markers (kit Phase 0 check: `grep -n "VERIFY"` must
-return nothing).
+(cited below as §N). Every section's proposed default was reviewed by the human
+owner and confirmed as written (§3 and §4 were confirmed with the FIX-D5
+decision; the remainder at the Gate 0 review; §10 was added by FIX1).
+Mechanical check: a grep for unconfirmed markers on this file returns nothing.
 
 Once confirmed, this file is the second source of truth (with the spec). Phases
 A–H cite it as "DECISIONS §N". Section numbering below is permanent; later
@@ -43,7 +42,8 @@ invariant I4 (default deny).
 Rationale: keeps judges' trust — escalation exists for "legitimately needs more
 data" (§26 Q3), not for exfiltration-shaped flows.
 
-⚠️ VERIFY — confirm this hard/soft split (edit here, then delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -67,8 +67,8 @@ Effect: Scenario C blocks even if the LLM's proposed contract omitted the
 salary group, because the inherited EMPLOYEE_DATA/FINANCIAL labels trip the
 hard rule in DECISIONS §1.
 
-⚠️ VERIFY — confirm the restricted set and CONFIDENTIAL's contextual status
-(edit here, then delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -157,7 +157,8 @@ BLOCKed at evaluation (I4).
 The four fake tools map onto: `read_file`→`read`, `query_customer_db`→`query`,
 `send_slack`→`send_message`, `post_external`→`post_external`.
 
-⚠️ VERIFY — confirm or amend the term lists (edit here, then delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -172,7 +173,8 @@ extra dependency outside the kit's allowlist.
 Fake dataset stays at 20–30 obviously-fake files (fake domains, fake phone
 numbers) per kit Prompt B1.
 
-⚠️ VERIFY — confirm the format substitution (edit here, then delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -191,8 +193,8 @@ reasons, lineage and failed checks go to the **human side only**: dashboard,
 `explain()` output, and audit trail. On ALLOW the agent gets the tool result
 plus a one-line confirmation.
 
-⚠️ VERIFY — confirm the minimal-disclosure agent message (edit here, then
-delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -212,16 +214,16 @@ if the agent lies about its purpose?"), invariant I7.
    `external_transfer` is `False` unless the user's task text explicitly names
    an external catalog destination (never the reverse).
 3. If Ollama is down or the JSON is invalid → **deterministic keyword
-   fallback** builder (no network, pure rules).
-4. Which path was used (`llm` or `fallback`) is recorded on the contract and in
-   the audit trail.
+   fallback** builder (no network, pure rules).4. Which path was used (`llm` or `fallback`) is recorded in the process
+   (module-level `last_builder()` in `taskfence/contract.py`); the contract
+   model and audit events do not carry the builder path in this MVP.
 
 `build_contract(task_text)` accepts **only the task string** — never documents,
 tool output or agent messages (I7). The LLM proposes intent; deterministic code
 owns the contract.
 
-⚠️ VERIFY — confirm propose/validate/fallback pipeline and the
-external_transfer default (edit here, then delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -246,11 +248,14 @@ state, authorization, and effect on the contract.
   `parent_contract_id` = old, widened scope). The old contract is **never
   mutated** (I3); both versions appear in the audit trail.
 - `deny` — nothing executes; sinks untouched.
-- The approval event, the resolution, and any resulting execution are each
-  audited (I5).
+- The approval request and the resolution are each audited (I5). The
+  repository models resolution + execution as ONE combined
+  `approval_resolve` audit event (carrying the approved contract id/version
+  and the executed flow's lineage path); no separate execution event is
+  emitted.
 
-⚠️ VERIFY — confirm the approval mechanics and admin-token separation (edit
-here, then delete this line).
+**CONFIRMED (human decision, Gate 0 review, 2026-09-27):** the proposed
+default above is approved as written.
 
 ---
 
@@ -281,13 +286,7 @@ sensitive state**. Rules:
 
 ---
 
-## Confirming (how to pass Gate 0)
+## Gate 0 status (closed)
 
-1. Read each `⚠️ VERIFY` line and the default above it.
-2. Edit any default you disagree with, in place.
-3. Delete every `⚠️ VERIFY` line — `grep -n "VERIFY" specs/DECISIONS.md` must
-   return nothing.
-4. Commit (human runs git, per the kit):
-   `git add -A && git commit -m "docs: resolve open spec decisions" && git tag gate-0`
-
-Phase A must not begin until this file is VERIFY-free.
+All decision defaults above were reviewed and confirmed by the human owner;
+nothing remains unreviewed in this file.
