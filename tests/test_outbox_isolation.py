@@ -16,6 +16,12 @@ guarantee end-to-end: they run real pytest subprocesses against the leaky
 modules and the scenario CLI, assert the tracked sinks come out
 byte-identical, and restore the tracked bytes in a finally block so a red
 run cannot leak dirt into the repository for the remaining tests.
+
+Fresh clones (FIX3) do not track outbox/*.jsonl (only .gitkeep, with the
+jsonl sinks gitignored), so an autouse fixture seeds missing sinks with
+stable sentinel bytes before snapshotting and removes them again on
+teardown — while developer checkouts with real sink files keep their
+original bytes untouched. No git commands are used anywhere here.
 """
 
 import hashlib
@@ -28,6 +34,11 @@ import pytest
 REPO_OUTBOX = Path("outbox").resolve()
 TRACKED_SINKS = ("external_api.jsonl", "slack_sales.jsonl")
 
+# Stable sentinel bytes for sinks missing in a clean clone: deterministic
+# content so byte-identity assertions remain meaningful. Only byte-identity
+# is ever asserted, never file content.
+SENTINEL_BYTES = b'{"sentinel": "outbox-isolation-regression-test"}\n'
+
 PYTEST_TARGETS = [
     "tests/test_tools.py",
     "tests/test_registry.py",
@@ -38,6 +49,43 @@ PYTEST_TARGETS = [
 def _snapshot() -> dict[Path, bytes]:
     return {REPO_OUTBOX / name: (REPO_OUTBOX / name).read_bytes()
             for name in TRACKED_SINKS}
+
+
+def _ensure_tracked_sinks() -> dict[Path, bool]:
+    """Create missing tracked-sink files with stable sentinel bytes and
+    return {path: created_by_this_helper} so teardown can remove exactly
+    what it created (never touching pre-existing developer files)."""
+    REPO_OUTBOX.mkdir(exist_ok=True)
+    created: dict[Path, bool] = {}
+    for name in TRACKED_SINKS:
+        path = REPO_OUTBOX / name
+        if not path.exists():
+            path.write_bytes(SENTINEL_BYTES)
+            created[path] = True
+    return created
+
+
+@pytest.fixture(autouse=True)
+def _seed_and_restore_missing_sinks():
+    """Guarantee both sink files exist for the snapshot, then restore the
+    exact pre-test filesystem state (bytes for pre-existing files, removal
+    for sentinel-seeded files, and the outbox/ directory itself if it was
+    created here and left empty)."""
+    preexisting: dict[Path, bytes] = {}
+    for name in TRACKED_SINKS:
+        path = REPO_OUTBOX / name
+        if path.exists():
+            preexisting[path] = path.read_bytes()
+    created = _ensure_tracked_sinks()
+    yield
+    for path in created:
+        path.unlink(missing_ok=True)
+    for path, data in preexisting.items():
+        path.write_bytes(data)
+    try:
+        REPO_OUTBOX.rmdir()  # only if we created it and it is empty
+    except OSError:
+        pass
 
 
 def _assert_untouched(before: dict[Path, bytes], context: str) -> None:
