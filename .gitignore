@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 taskfence.sqlite3
 taskfence.sqlite3-*
+
+# Runtime sink files: generated demo/test state, not source (FIX3).
+outbox/*.jsonl

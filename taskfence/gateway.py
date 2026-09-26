@@ -72,14 +72,6 @@ def build_sales_reporting_contract(task_text: str) -> TaskContract:
     Ollama is down — DECISIONS §8)."""
     from taskfence.contract import build_contract
     return build_contract(task_text)
-    return TaskContract(
-        contract_id="c-sales-stub",
-        purpose="sales_reporting",
-        allowed_data=["sales_reports"],
-        allowed_destinations=["sales_slack"],
-        allowed_actions=["read", "summarize", "send_message"],
-        external_transfer=False,
-        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
 def _now() -> str:

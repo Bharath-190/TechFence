@@ -90,6 +90,9 @@ ollama serve
 pytest -m ollama -q    # optional real-model test, only runs when reachable
 ```
 
+> **Ollama integration has not been exercised in this environment.** All
+> green results come from the deterministic fallback and scripted flows.
+
 ### Scenarios and metrics
 
 ```bash
