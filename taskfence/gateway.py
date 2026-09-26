@@ -11,6 +11,12 @@ lineage per DECISIONS §4; contracts come only from POST /tasks task text).
 DECISIONS §3: with GATE_OUT_OF_SCOPE_READS=False (default), an out-of-scope
 read is ALLOWed but tainted (session reads) and audited; with True it stays
 APPROVE for human review.
+
+FIX1 (approval integrity): approval records store the EXACT original tool
+args plus a binding to the reviewed contract (id + version + frozen
+snapshot). allow_once replays the exact request under that binding with the
+normal ALLOW bookkeeping; resolution fails closed on any missing/stale
+binding BEFORE the approval is claimed or the tool runs.
 """
 
 import os
@@ -19,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from taskfence import catalog, registry, tools
 from taskfence.approvals import ApprovalStore
@@ -128,7 +134,8 @@ def _handle_read(task_id: str, contract, tool: str, meta: dict, args: dict):
         request = FlowRequest(tool=tool, action=meta["action"],
                               source=str(args.get("path", "")),
                               destination="")
-        return _finish(task_id, contract, request, [], None)
+        return _finish(task_id, contract, request, [], None,
+                       tool_args=args, declared=[])
     content = registry.read_asset(asset_id)
     labels = classify(asset_id, content)
     TRACKER.register_asset(task_id, asset_id)
@@ -153,14 +160,15 @@ def _handle_read(task_id: str, contract, tool: str, meta: dict, args: dict):
             {"task_id": task_id, "source_asset": asset_id,
              "content": content}, **args)
         return _finish(task_id, contract, request, [asset_id], result,
-                       decision, tainted=tainted)
+                       decision, tainted=tainted, tool_args=args,
+                       declared=[asset_id])
     result = None
     if decision.outcome == "ALLOW":
         result = tools.TOOL_FUNCTIONS[tool](
             {"task_id": task_id, "source_asset": asset_id,
              "content": content}, **args)
     return _finish(task_id, contract, request, [asset_id], result,
-                   decision)
+                   decision, tool_args=args, declared=[asset_id])
 
 
 def _handle_outbound(task_id: str, contract, tool: str, meta: dict,
@@ -186,7 +194,7 @@ def _handle_outbound(task_id: str, contract, tool: str, meta: dict,
     request = FlowRequest(
         tool=tool, action=meta["action"],
         source=(declared[0] if declared else "session_reads"),
-        source_group=(next(iter(groups)) if groups else ""),
+        source_group=(sorted(groups)[0] if groups else ""),
         source_groups=frozenset(groups),
         destination=destination, labels=frozenset(labels),
         transformation=str(args.get("transformation", "compose")),
@@ -200,7 +208,7 @@ def _handle_outbound(task_id: str, contract, tool: str, meta: dict,
         TRACKER.record_sink(task_id, payload_node, destination)
     return _finish(task_id, contract, request,
                    TRACKER.path_to(task_id, payload_node), result,
-                   decision)
+                   decision, tool_args=args, declared=declared)
 
 
 def _save_state(task_id: str, contract) -> None:
@@ -216,7 +224,9 @@ def _save_state(task_id: str, contract) -> None:
 
 
 def _finish(task_id: str, contract, request: FlowRequest, lineage: list[str],
-            result, decision=None, tainted: bool = False) -> dict:
+            result, decision=None, tainted: bool = False,
+            tool_args: dict | None = None,
+            declared: list[str] | None = None) -> dict:
     if decision is None:
         decision = ENGINE.evaluate(contract, request)
     _audit(task_id, request, decision, lineage, contract)
@@ -234,8 +244,18 @@ def _finish(task_id: str, contract, request: FlowRequest, lineage: list[str],
         request_data = request.model_dump()
         request_data["labels"] = sorted(request_data["labels"])
         request_data["source_groups"] = sorted(request_data["source_groups"])
-        approval_id = APPROVALS.create(task_id, request.tool, request_data,
-                                       decision.reasons)
+        # FIX1: the record keeps BOTH the policy snapshot (request_data,
+        # payload may be truncated) and the exact original tool args, bound
+        # to the reviewed contract, with the request's declared sources.
+        approval_id = APPROVALS.create(
+            task_id, request.tool, request_data,
+            tool_args if isinstance(tool_args, dict) else {},
+            contract,
+            [a for a in (declared or []) if registry.resolve(a) is not None],
+            [registry.resolve(a)["data_group"]
+             for a in (declared or [])
+             if registry.resolve(a) is not None],
+            decision.reasons)
     return {"decision": decision.model_dump(), "agent_message": agent_message,
             "explain": LAST_DECISION[task_id]["explain"],
             "lineage_path": lineage, "tainted": tainted, "result": result,
@@ -280,6 +300,44 @@ class ResolveIn(BaseModel):
     choice: Literal["allow_once", "expand_task", "deny"]
 
 
+def _fail_closed(detail: str) -> HTTPException:
+    """FIX1: resolution binding failures never execute and never consume
+    the approval (status stays pending so the human can re-decide)."""
+    return HTTPException(status_code=409, detail=detail)
+
+
+def _reviewed_binding(record: dict) -> tuple[TaskContract, FlowRequest]:
+    """FIX1: verify the approval's binding to the reviewed contract version.
+
+    The repository keeps no contract history, so the record carries the
+    frozen snapshot of the contract the human reviewed; the live
+    CONTRACTS[task_id] entry is irrelevant to replay. Fails CLOSED when the
+    binding is missing or internally inconsistent — never falls back to the
+    current contract (kit FIX1-A).
+    """
+    snapshot = record.get("contract_snapshot")
+    stored_id = record.get("contract_id") or ""
+    stored_version = record.get("contract_version") or ""
+    if not isinstance(snapshot, dict) or not stored_id or not stored_version:
+        raise _fail_closed(
+            "approval has no verifiable contract binding; fail closed")
+    try:
+        reviewed = TaskContract.model_validate(snapshot)
+    except ValidationError:
+        raise _fail_closed(
+            "stored contract snapshot is invalid; fail closed")
+    if (reviewed.contract_id != stored_id
+            or reviewed.version != stored_version):
+        raise _fail_closed(
+            "approval contract binding mismatch; fail closed")
+    try:
+        stored = FlowRequest.model_validate(record["request"])
+    except ValidationError:
+        raise _fail_closed(
+            "stored request snapshot is invalid; fail closed")
+    return reviewed, stored
+
+
 @app.post("/approvals/{approval_id}/resolve")
 def resolve_approval(approval_id: str, body: ResolveIn,
                      request: Request):
@@ -290,16 +348,17 @@ def resolve_approval(approval_id: str, body: ResolveIn,
     if record["status"] != "pending":
         raise HTTPException(status_code=409, detail="already resolved")
     task_id = record["task_id"]
-    contract = CONTRACTS.get(task_id)
-    if contract is None:
+    if task_id not in CONTRACTS:
         raise HTTPException(status_code=404, detail="unknown task")
 
     if body.choice == "deny":
+        # Deny executes nothing; it stays available even for records with a
+        # broken binding so the human can always reject them.
         APPROVALS.set_status(approval_id, "denied")
         _audit_event(task_id, {
             "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
-            "contract_id": contract.contract_id,
-            "contract_version": contract.version,
+            "contract_id": record.get("contract_id") or "",
+            "contract_version": record.get("contract_version") or "",
             "tool": record["tool"], "action": "approval_resolve",
             "sources": [], "labels": [], "transformation": "",
             "destination": "", "decision": "BLOCK",
@@ -308,67 +367,104 @@ def resolve_approval(approval_id: str, body: ResolveIn,
         return {"status": "denied", "executed": False}
 
     if body.choice == "allow_once":
-        # Single-use: executes this stored request exactly once, with the
-        # exact contract that produced it. No contract change (DECISIONS §9).
-        APPROVALS.set_status(approval_id, "allowed_once")
-        stored = FlowRequest.model_validate(record["args"])
-        decision = ENGINE.evaluate(contract, stored)
+        # FIX1: single-use, exact replay. Verify the reviewed-contract
+        # binding and replayability BEFORE claiming the approval (status
+        # stays pending on any failure) or executing the tool. Replay runs
+        # under the reviewed contract version, never the current one.
+        reviewed, stored = _reviewed_binding(record)
+        tool_args = record.get("tool_args")
+        if not isinstance(tool_args, dict) or not tool_args:
+            raise _fail_closed(
+                "approval record lacks the exact original tool args; "
+                "fail closed")
+        meta = tools.TOOL_REGISTRY.get(record["tool"])
+        if meta is None:
+            raise _fail_closed(
+                "approval references an unknown tool; fail closed")
+        lineage: list[str] = []
+        if meta.get("action") in ("read", "query"):
+            asset_id = (stored.source
+                        if stored.source in registry.ASSETS else None)
+            if asset_id is None:
+                raise _fail_closed(
+                    "approved source asset is no longer resolvable; "
+                    "fail closed")
+            lineage = [asset_id]
+        decision = ENGINE.evaluate(reviewed, stored)
         if decision.outcome != "ALLOW":
             decision = decision.model_copy(update={
                 "outcome": "ALLOW",
                 "reasons": decision.reasons + [
                     "Human approved this single request."],
                 "failed_checks": decision.failed_checks})
-        result = None
-        meta = tools.TOOL_REGISTRY.get(record["tool"], {})
-        if meta and meta.get("action") in ("read", "query"):
-            asset_id = stored.source or None
-            content = registry.read_asset(asset_id) if asset_id else ""
+        APPROVALS.set_status(approval_id, "allowed_once")
+        if meta.get("action") in ("read", "query"):
+            asset_id = lineage[0]
+            content = registry.read_asset(asset_id)
             result = tools.TOOL_FUNCTIONS[record["tool"]](
                 {"task_id": task_id, "source_asset": asset_id,
-                 "content": content}, **(record["args"].get("args")
-                                         if isinstance(
-                                             record["args"].get("args"),
-                                             dict) else {}))
-        elif meta:
-            content = str(record["args"].get("payload")
-                          or record["args"].get("text") or "")
+                 "content": content}, **tool_args)
+            # Normal read bookkeeping: session registration is idempotent.
+            TRACKER.register_asset(task_id, asset_id)
+        else:
+            content = str(tool_args.get("text")
+                          or tool_args.get("payload") or "")
             result = tools.TOOL_FUNCTIONS[record["tool"]](
                 {"task_id": task_id, "source_asset": None,
-                 "content": content}, **(record["args"].get("args")
-                                         if isinstance(
-                                             record["args"].get("args"),
-                                             dict) else {}))
+                 "content": content}, **tool_args)
+            # Normal outbound bookkeeping: sink edge + full lineage path.
+            declared = list(record.get("declared_source_assets") or [])
+            payload_node = str(tool_args.get("payload_node")
+                               or (declared[0] if declared
+                                   else "outbound_payload"))
+            TRACKER.record_sink(task_id, payload_node, stored.destination)
+            lineage = TRACKER.path_to(task_id, payload_node)
+        LAST_DECISION[task_id] = {
+            "decision": decision.model_dump(),
+            "explain": explain(decision, stored, reviewed, lineage),
+            "lineage_path": lineage, "tool": stored.tool,
+            "destination": stored.destination}
+        _save_state(task_id, CONTRACTS[task_id])
         _audit_event(task_id, {
             "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
-            "contract_id": contract.contract_id,
-            "contract_version": contract.version,
+            "contract_id": reviewed.contract_id,
+            "contract_version": reviewed.version,
             "tool": record["tool"], "action": "approval_resolve",
             "sources": [stored.source], "labels": sorted(stored.labels),
             "transformation": "allow_once",
             "destination": stored.destination, "decision": "ALLOW",
             "reasons": ["Human approved this single request."],
-            "lineage_path": ""})
+            "lineage_path": " -> ".join(lineage)})
         return {"status": "allowed_once", "executed": True,
-                "decision": decision.model_dump(), "result": result}
+                "decision": decision.model_dump(), "result": result,
+                "lineage_path": lineage}
 
     # expand_task: NEW contract version (I3: the old one is never mutated).
-    APPROVALS.set_status(approval_id, "expanded")
-    stored = FlowRequest.model_validate(record["args"])
-    new_allowed_data = sorted(set(contract.allowed_data)
-                              | {g for g in stored.source_groups
-                                 | {stored.source_group}
-                                 if g in catalog.DATA_GROUPS})
-    new_actions = sorted(set(contract.allowed_actions) | {stored.action})
+    # FIX1-E: bound to the REVIEWED contract version; the grant set comes
+    # ONLY from the request's originally DECLARED source groups — never
+    # from session-taint source_groups. No declared group => fail closed.
+    reviewed, stored = _reviewed_binding(record)
+    declared_assets = list(record.get("declared_source_assets") or [])
+    declared_groups = sorted({
+        registry.resolve(asset)["data_group"]
+        for asset in declared_assets if registry.resolve(asset) is not None
+    } & catalog.DATA_GROUPS)
+    if not declared_groups:
+        raise _fail_closed(
+            "no declared source group to expand; fail closed")
+    new_allowed_data = sorted(set(reviewed.allowed_data)
+                              | set(declared_groups))
+    new_actions = sorted(set(reviewed.allowed_actions) | {stored.action})
     new_contract = TaskContract(
-        contract_id=contract.contract_id + "-x",
-        parent_contract_id=contract.contract_id,
-        purpose=contract.purpose,
+        contract_id=reviewed.contract_id + "-x",
+        parent_contract_id=reviewed.contract_id,
+        purpose=reviewed.purpose,
         allowed_data=new_allowed_data,
-        allowed_destinations=list(contract.allowed_destinations),
+        allowed_destinations=list(reviewed.allowed_destinations),
         allowed_actions=new_actions,
-        external_transfer=contract.external_transfer,
+        external_transfer=reviewed.external_transfer,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    APPROVALS.set_status(approval_id, "expanded")
     CONTRACTS[task_id] = new_contract
     _save_state(task_id, new_contract)
     _audit_event(task_id, {
@@ -381,7 +477,7 @@ def resolve_approval(approval_id: str, body: ResolveIn,
         "destination": stored.destination, "decision": "ALLOW",
         "reasons": [f"Task scope expanded to contract version "
                     f"{new_contract.version[:12]}…; parent "
-                    f"{contract.contract_id} unchanged."],
+                    f"{reviewed.contract_id} unchanged."],
         "lineage_path": ""})
     return {"status": "expanded",
             "contract": new_contract.model_dump()}
@@ -389,7 +485,44 @@ def resolve_approval(approval_id: str, body: ResolveIn,
 
 @app.get("/approvals")
 def list_approvals(task_id: str | None = None):
+    """Narrow pending list for orchestration; no args, no payload."""
     return {"pending": APPROVALS.pending(task_id)}
+
+
+@app.get("/approvals/{approval_id}")
+def approval_detail(approval_id: str, request: Request):
+    """FIX1-C: the human approval preview. Shows the EXACT request being
+    approved — tool, action, declared source group(s), destination, and the
+    full outbound payload — plus the reviewed contract binding.
+
+    Full tool_args are sensitive approval state (DECISIONS §10): this
+    endpoint is admin-gated like resolution (403 without the token), and
+    the generic unauthenticated pending list above stays narrow.
+    """
+    _require_admin(request)
+    record = APPROVALS.get(approval_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="unknown approval")
+    request_snap = record.get("request") or {}
+    tool_args = record.get("tool_args") or {}
+    return {
+        "approval_id": record["approval_id"],
+        "task_id": record["task_id"],
+        "status": record["status"],
+        "tool": record["tool"],
+        "action": request_snap.get("action", ""),
+        "destination": request_snap.get("destination", ""),
+        "source_groups": sorted(request_snap.get("source_groups") or []),
+        "declared_source_groups": list(
+            record.get("declared_source_groups") or []),
+        "payload": tool_args.get("text") or tool_args.get("payload")
+                   or request_snap.get("payload", ""),
+        "tool_args": tool_args,
+        "contract_id": record.get("contract_id", ""),
+        "contract_version": record.get("contract_version", ""),
+        "reasons": record.get("reasons", ""),
+        "created_at": record.get("created_at", ""),
+    }
 
 
 @app.get("/tasks/{task_id}")

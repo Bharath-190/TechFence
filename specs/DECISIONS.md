@@ -242,6 +242,33 @@ here, then delete this line).
 
 ---
 
+## 10. Approval record retention and privacy (FIX1)
+
+**Question:** FIX1 stores the EXACT original tool args (`tool_args`, including
+the full outbound payload) in the approval record so a human-approved request
+replays byte-for-byte. Sensitive data may therefore live in the approvals
+table — what are the storage rules?
+
+**Spec:** §16 (approval), §29 (audit), FIX1-D (approval-data retention).
+
+**Decision (MVP):** approval records containing full args are **admin-only
+sensitive state**. Rules:
+
+1. Full `tool_args` are stored ONLY in the approval record, never in the
+   general audit trail and never in unauthenticated responses
+   (`GET /approvals` stays a narrow projection; `GET /tasks/{id}` and
+   `GET /audit` never expose them).
+2. The human preview reads full args via an authorized path only: the local
+   dashboard's own SQLite connection, or the admin-gated
+   `GET /approvals/{id}` endpoint (403 without `X-Admin-Token`).
+3. For this MVP the record is retained for traceability after resolution.
+   Production must define data minimization (redact payloads not needed for
+   replay), retention/deletion windows, and encryption at rest before
+   reusing this design.
+4. No encryption dependencies are added for the hackathon MVP.
+
+---
+
 ## Confirming (how to pass Gate 0)
 
 1. Read each `⚠️ VERIFY` line and the default above it.

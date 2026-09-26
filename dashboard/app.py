@@ -95,6 +95,50 @@ def _pending_approvals() -> list[dict]:
         conn.close()
 
 
+def _approval_detail(approval_id: str) -> dict | None:
+    """FIX1: the human approval preview — tool, action, declared source
+    group(s), destination and the FULL outbound payload — read from the
+    dashboard's own SQLite approval-data path. The dashboard is the
+    human-side process: no HTTP token check is invented around this local
+    read (kit FIX1-C). Full tool_args never leave this view; the generic
+    unauthenticated gateway endpoints stay narrow."""
+    if not DB_PATH.exists():
+        return None
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT tool, args FROM approvals WHERE approval_id = ?",
+            (approval_id,)).fetchone()
+        if row is None:
+            return None
+        raw = json.loads(row[1])
+        if "request" in raw:  # FIX1 record layout
+            request_snap = raw.get("request") or {}
+            tool_args = raw.get("tool_args") or {}
+            declared_groups = list(raw.get("declared_source_groups") or [])
+            contract_id = raw.get("contract_id", "")
+            contract_version = raw.get("contract_version", "")
+        else:  # legacy record: bare FlowRequest snapshot, no binding
+            request_snap, tool_args, declared_groups = raw, {}, []
+            contract_id, contract_version = "", ""
+        return {
+            "tool": row[0],
+            "action": request_snap.get("action", ""),
+            "destination": request_snap.get("destination", ""),
+            "source_groups": sorted(request_snap.get("source_groups") or []),
+            "declared_source_groups": declared_groups,
+            "payload": tool_args.get("text") or tool_args.get("payload")
+                       or request_snap.get("payload", ""),
+            "tool_args": tool_args,
+            "contract_id": contract_id,
+            "contract_version": contract_version,
+        }
+    except (sqlite3.OperationalError, ValueError):
+        return None
+    finally:
+        conn.close()
+
+
 def _flow_dot(state: dict) -> str:
     decision = (state.get("last_decision") or {})
     outcome = (decision.get("decision") or {}).get("outcome", "BLOCK")
@@ -152,9 +196,19 @@ def live_panel():
     if approvals:
         st.warning(f"{len(approvals)} pending approval(s)")
         for approval in approvals:
+            detail = _approval_detail(approval["approval_id"]) or {}
             columns = st.columns([4, 1, 1, 1])
             columns[0].markdown(
                 f"**{approval['tool']}** — {approval['reasons'][:120]}")
+            if detail:
+                version = detail["contract_version"]
+                columns[0].markdown(
+                    f"Action `{detail['action']}` → "
+                    f"`{detail['destination']}` · declared groups: "
+                    f"**{', '.join(detail['declared_source_groups']) or '—'}**"
+                    f" · contract `{detail['contract_id']}`"
+                    + (f" @ `{version[:12]}…`" if version else ""))
+                columns[0].code(str(detail["payload"]), language=None)
             if columns[1].button("Allow Once", key=approval["approval_id"]):
                 _resolve(approval["approval_id"], "allow_once")
             if columns[2].button("Expand", key=approval["approval_id"] + "e"):
