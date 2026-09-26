@@ -43,6 +43,8 @@ def agent_client(tmp_path, monkeypatch):
     monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
     from taskfence.approvals import ApprovalStore
     monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(tmp_path / "appr.db"))
+    from taskfence.audit import TaskStateStore
+    monkeypatch.setattr(gw, "STATE", TaskStateStore(tmp_path / "state.db"))
     # Deterministic contract building: no network call to Ollama.
     monkeypatch.setattr("taskfence.contract._ollama_chat",
                         lambda task_text: None)

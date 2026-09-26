@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from taskfence import catalog, registry, tools
 from taskfence.approvals import ApprovalStore
-from taskfence.audit import AuditLog
+from taskfence.audit import AuditLog, TaskStateStore
 from taskfence.classifier import classify
 from taskfence.explain import explain
 from taskfence.lineage import LineageTracker
@@ -44,6 +44,7 @@ ENGINE = PolicyEngine()
 TRACKER = LineageTracker()
 AUDIT = AuditLog()
 APPROVALS = ApprovalStore()
+STATE = TaskStateStore()
 
 CONTRACTS: dict[str, TaskContract] = {}
 TASK_TEXT: dict[str, str] = {}
@@ -202,11 +203,24 @@ def _handle_outbound(task_id: str, contract, tool: str, meta: dict,
                    decision)
 
 
+def _save_state(task_id: str, contract) -> None:
+    """Persist live task state for the dashboard process (display only)."""
+    if task_id not in CONTRACTS:
+        return
+    STATE.save(task_id, {
+        "task_text": TASK_TEXT.get(task_id, ""),
+        "contract": CONTRACTS[task_id].model_dump(),
+        "last_decision": LAST_DECISION.get(task_id),
+        "session_reads": sorted(TRACKER.session_reads.get(task_id, set())),
+        "pending_approvals": APPROVALS.pending(task_id)})
+
+
 def _finish(task_id: str, contract, request: FlowRequest, lineage: list[str],
             result, decision=None, tainted: bool = False) -> dict:
     if decision is None:
         decision = ENGINE.evaluate(contract, request)
     _audit(task_id, request, decision, lineage, contract)
+    _save_state(task_id, contract)
     LAST_DECISION[task_id] = {
         "decision": decision.model_dump(),
         "explain": explain(decision, request, contract, lineage),
@@ -234,6 +248,7 @@ def create_task(body: TaskIn):
     contract = build_sales_reporting_contract(body.task_text)
     CONTRACTS[task_id] = contract
     TASK_TEXT[task_id] = body.task_text
+    _save_state(task_id, contract)
     return {"task_id": task_id, "contract": contract.model_dump()}
 
 
@@ -355,6 +370,7 @@ def resolve_approval(approval_id: str, body: ResolveIn,
         external_transfer=contract.external_transfer,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     CONTRACTS[task_id] = new_contract
+    _save_state(task_id, new_contract)
     _audit_event(task_id, {
         "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
         "contract_id": new_contract.contract_id,

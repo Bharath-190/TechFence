@@ -23,6 +23,8 @@ def client(tmp_path, monkeypatch):
                         LineageTracker(db_path=tmp_path / "lin.db"))
     monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
     monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(tmp_path / "appr.db"))
+    from taskfence.audit import TaskStateStore
+    monkeypatch.setattr(gw, "STATE", TaskStateStore(tmp_path / "state.db"))
     monkeypatch.setattr("taskfence.contract._ollama_chat",
                         lambda task_text: None)
     registry.reset_outbox()
