@@ -15,7 +15,7 @@ import hashlib
 import json
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, computed_field, field_validator
 
 from taskfence import catalog
 
@@ -68,9 +68,11 @@ class TaskContract(BaseModel):
             raise ValueError(f"unknown actions: {unknown}")
         return v
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def version(self) -> str:
-        """Deterministic content hash over every contract field."""
+        """Deterministic content hash over every contract field (included
+        in model_dump so every serialized contract carries its version)."""
         payload = {
             "contract_id": self.contract_id,
             "parent_contract_id": self.parent_contract_id,

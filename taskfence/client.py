@@ -41,7 +41,8 @@ class GatewayClient:
         return {"decision": body["decision"]["outcome"],
                 "agent_message": body["agent_message"],
                 "result": body.get("result"),
-                "tainted": body.get("tainted", False)}
+                "tainted": body.get("tainted", False),
+                "approval_id": body.get("approval_id")}
 
     def task_state(self, task_id: str) -> dict:
         with httpx.Client(timeout=self.timeout) as client:

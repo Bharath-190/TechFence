@@ -14,19 +14,22 @@ APPROVE for human review.
 """
 
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from taskfence import registry, tools
+from taskfence import catalog, registry, tools
+from taskfence.approvals import ApprovalStore
 from taskfence.audit import AuditLog
 from taskfence.classifier import classify
 from taskfence.explain import explain
 from taskfence.lineage import LineageTracker
 from taskfence.models import FlowRequest, TaskContract
 from taskfence.policy import PolicyEngine
+from typing import Literal
 
 GATE_OUT_OF_SCOPE_READS = False  # DECISIONS §3 (kit Prompt C2 flag)
 
@@ -40,6 +43,7 @@ app = FastAPI(title="TaskFence Gateway")
 ENGINE = PolicyEngine()
 TRACKER = LineageTracker()
 AUDIT = AuditLog()
+APPROVALS = ApprovalStore()
 
 CONTRACTS: dict[str, TaskContract] = {}
 TASK_TEXT: dict[str, str] = {}
@@ -85,6 +89,11 @@ def _resolve_asset(args: dict) -> str | None:
         if Path(entry[0]).name == Path(path).name:
             return candidate
     return None
+
+
+def _audit_event(task_id: str, event: dict) -> None:
+    """Append a raw audit event (approval workflow, contract versions)."""
+    AUDIT.log_event(event)
 
 
 def _audit(task_id: str, request: FlowRequest, decision, lineage: list[str],
@@ -196,7 +205,6 @@ def _handle_outbound(task_id: str, contract, tool: str, meta: dict,
 def _finish(task_id: str, contract, request: FlowRequest, lineage: list[str],
             result, decision=None, tainted: bool = False) -> dict:
     if decision is None:
-        from taskfence.policy import HARD_UNKNOWN_ENTITY
         decision = ENGINE.evaluate(contract, request)
     _audit(task_id, request, decision, lineage, contract)
     LAST_DECISION[task_id] = {
@@ -207,14 +215,22 @@ def _finish(task_id: str, contract, request: FlowRequest, lineage: list[str],
     agent_message = {"ALLOW": AGENT_MESSAGE_ALLOW,
                      "APPROVE": AGENT_MESSAGE_APPROVE,
                      "BLOCK": AGENT_MESSAGE_BLOCK}[decision.outcome]
+    approval_id = None
+    if decision.outcome == "APPROVE":
+        request_data = request.model_dump()
+        request_data["labels"] = sorted(request_data["labels"])
+        request_data["source_groups"] = sorted(request_data["source_groups"])
+        approval_id = APPROVALS.create(task_id, request.tool, request_data,
+                                       decision.reasons)
     return {"decision": decision.model_dump(), "agent_message": agent_message,
             "explain": LAST_DECISION[task_id]["explain"],
-            "lineage_path": lineage, "tainted": tainted, "result": result}
+            "lineage_path": lineage, "tainted": tainted, "result": result,
+            "approval_id": approval_id}
 
 
 @app.post("/tasks")
 def create_task(body: TaskIn):
-    task_id = f"task-{datetime.now(timezone.utc).timestamp():.0f}"
+    task_id = f"task-{uuid.uuid4().hex[:12]}"
     contract = build_sales_reporting_contract(body.task_text)
     CONTRACTS[task_id] = contract
     TASK_TEXT[task_id] = body.task_text
@@ -225,7 +241,6 @@ def create_task(body: TaskIn):
 def tool_call(task_id: str, body: ToolCallIn):
     contract = CONTRACTS.get(task_id)
     if contract is None:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="unknown task")
     meta = tools.TOOL_REGISTRY.get(body.tool)
     if meta is None:  # I4: unknown tool => BLOCK + audit, never execute
@@ -237,16 +252,140 @@ def tool_call(task_id: str, body: ToolCallIn):
     return _handle_outbound(task_id, contract, body.tool, meta, body.args)
 
 
+def _require_admin(request: Request) -> None:
+    """Human-only resolution: the agent-side GatewayClient never holds this
+    token (DECISIONS §9)."""
+    expected = os.environ.get("TASKFENCE_ADMIN_TOKEN")
+    if not expected or request.headers.get("X-Admin-Token") != expected:
+        raise HTTPException(status_code=403,
+                            detail="admin token required")
+
+
+class ResolveIn(BaseModel):
+    choice: Literal["allow_once", "expand_task", "deny"]
+
+
+@app.post("/approvals/{approval_id}/resolve")
+def resolve_approval(approval_id: str, body: ResolveIn,
+                     request: Request):
+    _require_admin(request)
+    record = APPROVALS.get(approval_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="unknown approval")
+    if record["status"] != "pending":
+        raise HTTPException(status_code=409, detail="already resolved")
+    task_id = record["task_id"]
+    contract = CONTRACTS.get(task_id)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+
+    if body.choice == "deny":
+        APPROVALS.set_status(approval_id, "denied")
+        _audit_event(task_id, {
+            "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
+            "contract_id": contract.contract_id,
+            "contract_version": contract.version,
+            "tool": record["tool"], "action": "approval_resolve",
+            "sources": [], "labels": [], "transformation": "",
+            "destination": "", "decision": "BLOCK",
+            "reasons": ["Human denied the approval request."],
+            "lineage_path": ""})
+        return {"status": "denied", "executed": False}
+
+    if body.choice == "allow_once":
+        # Single-use: executes this stored request exactly once, with the
+        # exact contract that produced it. No contract change (DECISIONS §9).
+        APPROVALS.set_status(approval_id, "allowed_once")
+        stored = FlowRequest.model_validate(record["args"])
+        decision = ENGINE.evaluate(contract, stored)
+        if decision.outcome != "ALLOW":
+            decision = decision.model_copy(update={
+                "outcome": "ALLOW",
+                "reasons": decision.reasons + [
+                    "Human approved this single request."],
+                "failed_checks": decision.failed_checks})
+        result = None
+        meta = tools.TOOL_REGISTRY.get(record["tool"], {})
+        if meta and meta.get("action") in ("read", "query"):
+            asset_id = stored.source or None
+            content = registry.read_asset(asset_id) if asset_id else ""
+            result = tools.TOOL_FUNCTIONS[record["tool"]](
+                {"task_id": task_id, "source_asset": asset_id,
+                 "content": content}, **(record["args"].get("args")
+                                         if isinstance(
+                                             record["args"].get("args"),
+                                             dict) else {}))
+        elif meta:
+            content = str(record["args"].get("payload")
+                          or record["args"].get("text") or "")
+            result = tools.TOOL_FUNCTIONS[record["tool"]](
+                {"task_id": task_id, "source_asset": None,
+                 "content": content}, **(record["args"].get("args")
+                                         if isinstance(
+                                             record["args"].get("args"),
+                                             dict) else {}))
+        _audit_event(task_id, {
+            "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
+            "contract_id": contract.contract_id,
+            "contract_version": contract.version,
+            "tool": record["tool"], "action": "approval_resolve",
+            "sources": [stored.source], "labels": sorted(stored.labels),
+            "transformation": "allow_once",
+            "destination": stored.destination, "decision": "ALLOW",
+            "reasons": ["Human approved this single request."],
+            "lineage_path": ""})
+        return {"status": "allowed_once", "executed": True,
+                "decision": decision.model_dump(), "result": result}
+
+    # expand_task: NEW contract version (I3: the old one is never mutated).
+    APPROVALS.set_status(approval_id, "expanded")
+    stored = FlowRequest.model_validate(record["args"])
+    new_allowed_data = sorted(set(contract.allowed_data)
+                              | {g for g in stored.source_groups
+                                 | {stored.source_group}
+                                 if g in catalog.DATA_GROUPS})
+    new_actions = sorted(set(contract.allowed_actions) | {stored.action})
+    new_contract = TaskContract(
+        contract_id=contract.contract_id + "-x",
+        parent_contract_id=contract.contract_id,
+        purpose=contract.purpose,
+        allowed_data=new_allowed_data,
+        allowed_destinations=list(contract.allowed_destinations),
+        allowed_actions=new_actions,
+        external_transfer=contract.external_transfer,
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    CONTRACTS[task_id] = new_contract
+    _audit_event(task_id, {
+        "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
+        "contract_id": new_contract.contract_id,
+        "contract_version": new_contract.version,
+        "tool": record["tool"], "action": "approval_resolve",
+        "sources": [stored.source], "labels": sorted(stored.labels),
+        "transformation": "expand_task",
+        "destination": stored.destination, "decision": "ALLOW",
+        "reasons": [f"Task scope expanded to contract version "
+                    f"{new_contract.version[:12]}…; parent "
+                    f"{contract.contract_id} unchanged."],
+        "lineage_path": ""})
+    return {"status": "expanded",
+            "contract": new_contract.model_dump()}
+
+
+@app.get("/approvals")
+def list_approvals(task_id: str | None = None):
+    return {"pending": APPROVALS.pending(task_id)}
+
+
 @app.get("/tasks/{task_id}")
 def task_state(task_id: str):
     if task_id not in CONTRACTS:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="unknown task")
     return {"task_id": task_id, "task_text": TASK_TEXT[task_id],
             "contract": CONTRACTS[task_id].model_dump(),
             "last_decision": LAST_DECISION.get(task_id),
             "session_reads": sorted(
-                TRACKER.session_reads.get(task_id, set()))}
+                TRACKER.session_reads.get(task_id, set())),
+            "pending_approvals": APPROVALS.pending(task_id)}
 
 
 @app.get("/audit")
