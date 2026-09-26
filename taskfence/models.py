@@ -127,6 +127,9 @@ class FlowRequest(BaseModel):
     action: str
     source: str
     source_group: str = ""
+    # Outbound flows may combine several source groups (declared inputs UNION
+    # session reads under conservative lineage, DECISIONS §4).
+    source_groups: frozenset[str] = frozenset()
     destination: str
     labels: frozenset[str] = frozenset()
     transformation: str = ""

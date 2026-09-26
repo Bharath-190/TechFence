@@ -37,7 +37,8 @@ class LineageTracker:
         self._ensure_schema()
         self._graph = nx.DiGraph()
         self._load_graph()
-        self.session_reads: set[str] = set()
+        # Per-task session reads (DECISIONS §4 conservative taint).
+        self.session_reads: dict[str, set[str]] = {}
 
     # -- schema / persistence -------------------------------------------------
     def _ensure_schema(self) -> None:
@@ -68,7 +69,7 @@ class LineageTracker:
         session read for conservative taint."""
         labels = set(base_labels(asset_id))
         self._add_node(task_id, asset_id, labels)
-        self.session_reads.add(asset_id)
+        self.session_reads.setdefault(task_id, set()).add(asset_id)
 
     def derive(self, task_id: str, input_ids: list[str], transformation: str,
                output_id: str) -> None:
@@ -137,7 +138,7 @@ class LineageTracker:
         for ancestor in self.ancestors(task_id, node_id):
             labels |= self._node_labels(task_id, ancestor)
         if include:
-            for read in self.session_reads:
+            for read in self.session_reads.get(task_id, set()):
                 labels |= set(base_labels(read))
         return labels
 

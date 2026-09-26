@@ -49,14 +49,23 @@ class PolicyEngine:
         soft: List[tuple] = []
 
         # 1. Source check (spec §27 step 1).
-        if request.source_group in catalog.DATA_GROUPS:
-            if request.source_group not in contract.allowed_data:
-                soft.append((Check.SOURCE, SOFT_SOURCE_OUTSIDE_CONTRACT,
-                             f"Data group {request.source_group!r} is not in "
-                             f"the task's allowed data."))
-        else:
+        #    Reads (no destination) only check the primary source group;
+        #    outbound flows check every contributing group (DECISIONS §4).
+        groups: set = set(request.source_groups) or {request.source_group}
+        unknown = [g for g in groups if g not in catalog.DATA_GROUPS]
+        if unknown:
             hard.append((Check.SOURCE, HARD_UNKNOWN_ENTITY,
                          f"Source {request.source!r} is unknown; default deny."))
+        else:
+            outside = sorted(g for g in groups
+                             if g not in contract.allowed_data)
+            if outside:
+                # Reads (DECISIONS §3): policy says APPROVE; the gateway may
+                # downgrade to allow-but-taint when its read-gate flag is off.
+                soft.append((
+                    Check.SOURCE, SOFT_SOURCE_OUTSIDE_CONTRACT,
+                    f"Data group {outside[0]!r} is not in the task's "
+                    f"allowed data."))
 
         # 2. Tool and action check (spec §27 step 2).
         if request.tool not in catalog.TOOLS:
@@ -77,7 +86,10 @@ class PolicyEngine:
 
         # 3. Destination check (spec §27 step 3), incl. external-transfer
         # policy (spec §27 step 4) when the destination itself is allowed.
-        if request.destination not in catalog.DESTINATIONS:
+        #    Reads (no destination) skip destination checks entirely.
+        if request.destination == "":
+            pass
+        elif request.destination not in catalog.DESTINATIONS:
             hard.append((Check.DESTINATION, HARD_UNKNOWN_ENTITY,
                          f"Destination {request.destination!r} is unknown; "
                          f"default deny."))
@@ -103,7 +115,9 @@ class PolicyEngine:
         # BLOCK when the destination is not an allowed internal one, APPROVE
         # otherwise (DECISIONS §1).
         restricted = request.labels & catalog.RESTRICTED_LABELS
-        if restricted:
+        # Reads skip the escape check (no destination to escape to); the
+        # gateway handles them via session taint (DECISIONS §3).
+        if restricted and request.destination != "":
             if (request.destination not in contract.allowed_destinations
                     or request.destination in catalog.EXTERNAL_DESTINATIONS):
                 hard.append(
