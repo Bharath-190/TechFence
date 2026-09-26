@@ -56,8 +56,11 @@ class ToolCallIn(BaseModel):
 
 
 def build_sales_reporting_contract(task_text: str) -> TaskContract:
-    """Temporary stub (kit Prompt C2); Prompt D1 replaces this builder."""
-    del task_text  # stub ignores content; D1 parses it
+    """Contract builder entry point (kit Prompt D1 wires the real builder
+    in here; the deterministic keyword fallback keeps the demo alive when
+    Ollama is down — DECISIONS §8)."""
+    from taskfence.contract import build_contract
+    return build_contract(task_text)
     return TaskContract(
         contract_id="c-sales-stub",
         purpose="sales_reporting",
