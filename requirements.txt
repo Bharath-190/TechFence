@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic>=2
+networkx
+streamlit
+requests
+httpx
+pytest
+# ollama runs as an external local service; the optional real-model tests
+# use plain httpx against localhost:11434, so no extra client package needed.
