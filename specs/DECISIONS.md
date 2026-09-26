@@ -91,8 +91,9 @@ the team prefers demonstrating read gating instead.
 
 Either way the read is audited (I5) and the taint is recorded (I6).
 
-⚠️ VERIFY — confirm Option 1 as default with the boolean escape hatch (edit
-here, then delete this line).
+**CONFIRMED (human decision, FIX-D5 phase, 2026-09-27):** Option 1 stands as
+the default — out-of-scope reads are ALLOWed but taint the session and are
+audited, with the `GATE_OUT_OF_SCOPE_READS = False` boolean escape hatch.
 
 ---
 
@@ -113,10 +114,21 @@ mode can **over-block legitimate flows**: e.g. a genuine task that reads sales
 data *and* public info, then also read the salary file earlier in the session,
 would see its outbound message tainted by EMPLOYEE_DATA. For the hackathon demo
 this is acceptable and honest; `reports/results.md` must list any such false
-positive rather than suppress it.
+positive rather than suppress it.**CONFIRMED (human decision, FIX-D5 phase, 2026-09-27):** Conservative mode
+stands — **Session-taint scope: KEEP CONSERVATIVE** (Option A of the
+post-build fix kit). Every asset read during the task may contribute to
+outbound lineage; Scenario G's APPROVE false positive is accepted and must
+remain disclosed in `reports/results.md` (legitimate flows allowed: 2/3).
+There is no requirement to improve that figure, and taint code must not be
+changed merely to make the metric look better.
 
-⚠️ VERIFY — confirm conservative mode as the default and accept the disclosed
-false-positive risk (edit here, then delete this line).
+FIX1 interaction (recorded explicitly before the demo): because session
+reads act as implicit outbound source context, an outbound request that
+declares NO source assets may still be APPROVEable (soft
+`source_outside_contract`) from session-taint groups alone. FIX1 makes
+`expand_task` fail closed for such requests (no declared source group to
+expand), so the only human resolution is repeated `allow_once`. This is
+accepted friction, not a defect.
 
 ---
 
