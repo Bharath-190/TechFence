@@ -87,8 +87,18 @@ fallback + ScriptedAgent). To use Qwen3:
 ```bash
 ollama pull qwen3
 ollama serve
-pytest -m ollama -q    # optional real-model test, only runs when reachable
+pytest -m ollama -q    # optional real-model test (skips if unavailable)
 ```
+
+The marked test skips with an explicit reason when Ollama is unreachable or
+when the configured model (`TASKFENCE_MODEL`, default `qwen3`) is not pulled
+— it never fails the suite and never silently passes. With both available it
+runs a real Qwen3 agent end-to-end through the gateway and asserts the
+gateway-enforcement invariants on that live path: the gateway's decision
+(not the model) controls tool execution, the agent reaches tools only via
+GatewayClient, and every decision is retrievable via `GET /audit`. The
+default `pytest -q` run stays fully green without Ollama (the test is
+deselected by default).
 
 > **Ollama integration has not been exercised in this environment.** All
 > green results come from the deterministic fallback and scripted flows.
