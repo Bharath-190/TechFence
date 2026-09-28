@@ -90,6 +90,43 @@ def test_exactly_one_audit_event_per_call(client):
     assert after_unknown == after_block + 1  # I5 covers BLOCKs too
 
 
+def test_approve_decision_is_audited_completing_every_outcome(
+        agent_client, monkeypatch):
+    """Invariant 7, APPROVE leg: 'every decision is audited' covers all three
+    outcomes. ALLOW/BLOCK/unknown-tool parity is pinned by
+    test_exactly_one_audit_event_per_call; this closes the APPROVE leg and
+    the human resolution event. Uses the shared agent_client fixture for
+    full store isolation (APPROVALS included)."""
+    monkeypatch.setenv("TASKFENCE_ADMIN_TOKEN", "devtoken")
+    tc = agent_client.test_client
+    task_id = tc.post("/tasks", json={
+        "task_text": "Summarize Q3 sales and post it to #sales."
+    }).json()["task_id"]
+    before = len(tc.get("/audit", params={"task_id": task_id}).json()["events"])
+    body = tc.post(f"/tasks/{task_id}/tool-call", json={
+        "tool": "send_slack",
+        "args": {"channel": "#hr-ops",
+                 "text": "regional conversion summary",
+                 "source_assets": ["customer_db"]}}).json()
+    assert body["decision"]["outcome"] == "APPROVE", body
+    events = tc.get("/audit",
+                    params={"task_id": task_id}).json()["events"]
+    assert len(events) == before + 1  # exactly one event for the APPROVE
+    assert events[-1]["decision"] == "APPROVE"
+    assert events[-1]["tool"] == "send_slack"
+    # The human resolution is audited as its own append-only event:
+    resolved = tc.post(f"/approvals/{body['approval_id']}/resolve",
+                       json={"choice": "deny"},
+                       headers={"X-Admin-Token": "devtoken"})
+    assert resolved.status_code == 200
+    resolve_events = [e for e in tc.get(
+        "/audit", params={"task_id": task_id}).json()["events"]
+        if e["action"] == "approval_resolve"]
+    assert len(resolve_events) == 1
+    assert resolve_events[0]["decision"] == "BLOCK"  # deny executes nothing
+    assert registry.sink_lines("slack_sales") == []
+
+
 def test_unknown_tool_response_shape(client):
     task_id = _create_task(client)
     body = _call(client, task_id, "no_such_tool", {})
