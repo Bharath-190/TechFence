@@ -30,6 +30,15 @@ SCENARIOS = {
     "Scenario B — injected agent (poisoned notes)": "scenario_b",
     "Scenario C — derived salary bypass": "scenario_c",
 }
+
+# E/F/G replay via scenarios/replay.py (same GatewayClient execution path
+# as the agent CLI; F's structural probes included). G is the DISCLOSED
+# conservative-taint false positive — the label says so (kit I5).
+REPLAY_SCENARIOS = {
+    "Scenario E — unknown destination (default deny)": "scenario_e",
+    "Scenario F — contract tamper attempt (impossible)": "scenario_f",
+    "Scenario G — precision check (known false positive)": "scenario_g",
+}
 SCENARIO_TASK = "Summarize Q3 sales and post it to #sales."
 
 # Scenario D scope-expansion request (same shape the agent sends in
@@ -144,6 +153,27 @@ def _approval_detail(approval_id: str) -> dict | None:
         conn.close()
 
 
+# Sink display paths (kit I5): the dashboard shows whether anything was
+# delivered — explicitly empty vs populated — after each replayed run.
+SINK_FILES = {"slack_sales": "outbox/slack_sales.jsonl",
+              "external_api": "outbox/external_api.jsonl"}
+
+
+def _sink_summary() -> str:
+    """Line counts of the gateway's sink files (read-only display; the
+    gateway writes them CWD-relative, the dashboard shares that cwd)."""
+    parts = []
+    for name, rel in SINK_FILES.items():
+        path = Path(rel)
+        try:
+            count = sum(1 for _ in path.open(encoding="utf-8")) \
+                if path.exists() else 0
+        except OSError:
+            count = 0
+        parts.append(f"{name}: **{count}** line(s)")
+    return " · ".join(parts)
+
+
 def _flow_dot(state: dict) -> str:
     decision = (state.get("last_decision") or {})
     outcome = (decision.get("decision") or {}).get("outcome", "BLOCK")
@@ -197,6 +227,8 @@ def live_panel():
             f"### DECISION: <span style='color:{color}'>{outcome}</span>",
             unsafe_allow_html=True)
         st.code(decision.get("explain", ""), language=None)
+    st.caption("OUTBOX (data actually delivered): " + _sink_summary()
+               + " — 0 lines means nothing was delivered.")
     approvals = _pending_approvals()
     if approvals:
         st.warning(f"{len(approvals)} pending approval(s)")
@@ -361,13 +393,18 @@ st.caption("Purpose-Bound Security for AI Agents — "
 
 with st.sidebar:
     st.header("Controls")
-    st.subheader("Run a scenario")
+    st.caption("Replay a demo scenario")
     for label, script in SCENARIOS.items():
         if st.button(label):
             subprocess.Popen(
                 [sys.executable, "-m", "taskfence.agent",
                  "--task", SCENARIO_TASK, "--scripted", script])
             st.toast(f"Started {script}")
+    for label, replay in REPLAY_SCENARIOS.items():
+        if st.button(label):
+            subprocess.Popen(
+                [sys.executable, "-m", "scenarios.replay", replay])
+            st.toast(f"Started {replay}")
     st.divider()
     st.caption("Guided approval demo")
     if st.button("Run Scenario D — approval walkthrough"):
