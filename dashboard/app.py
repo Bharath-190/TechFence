@@ -52,17 +52,65 @@ def _db() -> sqlite3.Connection:
     return conn
 
 
+def _latest_task_and_state() -> tuple[str | None, dict | None]:
+    if not DB_PATH.exists():
+        return None, None
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT task_id, state FROM task_state"
+            " ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        return (row[0], json.loads(row[1])) if row else (None, None)
+    except sqlite3.OperationalError:
+        return None, None
+    finally:
+        conn.close()
+
+
 def _latest_state() -> dict | None:
+    return _latest_task_and_state()[1]
+
+
+def _latest_audit_for_task(task_id: str | None) -> dict | None:
+    """Most recent audit event for the latest task — verbatim stored flow
+    fields (sources, labels, transformation, destination) for the decision
+    panel. Read-only; the panel assembles display strings only."""
     if not DB_PATH.exists():
         return None
     conn = _db()
     try:
-        row = conn.execute(
-            "SELECT state FROM task_state ORDER BY updated_at DESC LIMIT 1"
-        ).fetchone()
-        return json.loads(row[0]) if row else None
+        if task_id:
+            row = conn.execute(
+                "SELECT sources, labels, transformation, destination"
+                " FROM audit_events WHERE task_id = ?"
+                " ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT sources, labels, transformation, destination"
+                " FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        return dict(zip(["sources", "labels", "transformation",
+                         "destination"], row))
     except sqlite3.OperationalError:
         return None
+    finally:
+        conn.close()
+
+
+def _approval_ids_by_task() -> dict[str, str]:
+    """task_id -> approval_id map for the audit trail's approval column
+    (display mapping from stored approvals; latest approval per task)."""
+    if not DB_PATH.exists():
+        return {}
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT task_id, approval_id FROM approvals ORDER BY rowid")
+        return dict(rows.fetchall())
+    except sqlite3.OperationalError:
+        return {}
     finally:
         conn.close()
 
@@ -86,7 +134,12 @@ def _audit_events(decision_filter: str | None) -> list[dict]:
         names = ["timestamp", "task_id", "tool", "action", "sources",
                  "labels", "destination", "decision", "reasons",
                  "lineage_path"]
-        return [dict(zip(names, row)) for row in rows.fetchall()]
+        events = [dict(zip(names, row)) for row in rows.fetchall()]
+        if events:  # kit I6: approval ID column, when applicable
+            approval_ids = _approval_ids_by_task()
+            for event in events:
+                event["approval_id"] = approval_ids.get(event["task_id"], "")
+        return events
     except sqlite3.OperationalError:
         return []
     finally:
@@ -219,14 +272,6 @@ def live_panel():
             st.graphviz_chart(_lineage_dot(state))
         else:
             st.info("Lineage appears after the first decision.")
-    decision = ((state or {}).get("last_decision") or {})
-    if decision:
-        outcome = decision["decision"]["outcome"]
-        color = OUTCOME_COLOR.get(outcome, "#c62828")
-        st.markdown(
-            f"### DECISION: <span style='color:{color}'>{outcome}</span>",
-            unsafe_allow_html=True)
-        st.code(decision.get("explain", ""), language=None)
     st.caption("OUTBOX (data actually delivered): " + _sink_summary()
                + " — 0 lines means nothing was delivered.")
     approvals = _pending_approvals()
@@ -387,6 +432,50 @@ def scenario_d_panel() -> None:
                    "the approved execution.")
 
 
+def _decision_panel() -> None:
+    """Kit I6: the six-field decision panel — Decision, Why?, Data Flow,
+    Contract, Classification, Lineage. Every value is read verbatim from
+    stored task state and the audit table; the UI only assembles display
+    strings and computes nothing about security."""
+    task_id, state = _latest_task_and_state()
+    st.subheader("CURRENT DECISION")
+    decision = (state or {}).get("last_decision")
+    if not decision:
+        st.info("No decision yet — run a scenario from the sidebar.")
+        return
+    outcome = (decision.get("decision") or {}).get("outcome", "BLOCK")
+    color = OUTCOME_COLOR.get(outcome, "#c62828")
+    st.markdown(
+        f"### DECISION: <span style='color:{color}'>{outcome}</span>",
+        unsafe_allow_html=True)
+
+    st.markdown("#### WHY?")
+    st.code(decision.get("explain", ""), language=None)
+
+    event = _latest_audit_for_task(task_id) or {}
+    st.markdown("#### DATA FLOW")
+    flow_parts = ((event.get("sources") or "").strip(),
+                  (event.get("transformation") or "").strip(),
+                  (event.get("destination")
+                   or decision.get("destination") or "").strip())
+    st.markdown(" -> ".join(part for part in flow_parts if part)
+                or "(no flow recorded)")
+
+    st.markdown("#### CONTRACT")
+    contract = (state or {}).get("contract") or {}
+    version = str(contract.get("version", ""))
+    purpose = contract.get("purpose", "")
+    st.markdown(f"{purpose} — v{version[:12]}" if version
+                else purpose or "(no contract)")
+
+    st.markdown("#### CLASSIFICATION")
+    st.markdown((event.get("labels") or "").strip() or "(none)")
+
+    st.markdown("#### LINEAGE PATH")
+    chain = decision.get("lineage_path") or []
+    st.markdown(" -> ".join(chain) if chain else "(not tracked)")
+
+
 st.title("🛡️ TASKFENCE")
 st.caption("Purpose-Bound Security for AI Agents — "
            "the agent decides HOW; TaskFence decides WHETHER.")
@@ -431,6 +520,8 @@ with st.sidebar:
                 sink.write_text("", encoding="utf-8")
         st.toast("Reset complete")
 
+_decision_panel()
+
 state = _latest_state()
 
 left, right = st.columns(2)
@@ -443,7 +534,7 @@ with left:
     else:
         st.info("No task yet.")
 with right:
-    st.subheader("TASK CONTRACT")
+    st.subheader("CONTRACT SCOPE")
     contract = (state or {}).get("contract")
     if contract:
         st.markdown(
