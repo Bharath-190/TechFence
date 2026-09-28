@@ -1,9 +1,11 @@
 """TaskFence dashboard (spec §17, §29, §31; kit Prompts F1, F2, F3).
 
-Reads SQLite only — it is a separate process from the gateway. The UI
-computes NOTHING about security: every decision, reason and lineage chain
-is rendered from what the gateway persisted. Sidebar buttons are triggers
-only (scenario runs, approval resolution via the gateway API, reset).
+Reads SQLite, the generated scenario report and sink files only — it is a
+separate process from the gateway. The UI computes NOTHING about security:
+every decision, reason, lineage chain and metric is rendered from what the
+gateway persisted or scenarios.run_all generated. Sidebar buttons are
+triggers only (scenario runs, approval resolution via the gateway API,
+reset).
 """
 
 import json
@@ -225,6 +227,120 @@ def _sink_summary() -> str:
             count = 0
         parts.append(f"{name}: **{count}** line(s)")
     return " · ".join(parts)
+
+
+# Kit I7: report-sourced metrics. The dashboard NEVER re-derives scenario
+# numbers — it parses reports/results.md (scenarios.run_all's own output)
+# and counts stored audit rows. Path is read per call (env override for
+# tests); the default matches run_all's REPORT_PATH.
+DEFAULT_REPORT = "reports/results.md"
+
+
+def _scenario_report_metrics() -> dict:
+    """Parse the generated report: scenario row count and the X/Y lines.
+    Any missing figure stays None — the UI then says so instead of
+    guessing (never invent metrics)."""
+    out = {"scenarios": None, "unauthorized": None, "legitimate": None}
+    try:
+        text = Path(os.environ.get("TASKFENCE_REPORT_PATH",
+                                   DEFAULT_REPORT)).read_text(encoding="utf-8")
+    except OSError:
+        return out
+    table_rows = 0  # header + one row per scenario flow (separator excluded)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("| "):
+            table_rows += 1
+        elif stripped.startswith("Unauthorized flows intercepted:"):
+            parts = stripped.split("**")
+            if len(parts) >= 2:
+                out["unauthorized"] = parts[1]
+        elif stripped.startswith("Legitimate flows allowed:"):
+            parts = stripped.split("**")
+            if len(parts) >= 2:
+                out["legitimate"] = parts[1]
+    # Markdown table = header row + one row per reproduced flow:
+    if table_rows >= 2:
+        out["scenarios"] = table_rows - 1
+    return out
+
+
+def _audit_metrics() -> dict:
+    """Counts derived from stored audit rows only (kit I7): approval-gated
+    flows (APPROVE decisions), exact one-time approvals executed
+    (approval_resolve events with outcome ALLOW), and a structural
+    auditability check over the stored session — never a bare 100%."""
+    metrics = {"approval_gated": 0, "one_time": 0, "events": 0,
+               "incomplete": 0, "tasks_without_events": 0}
+    # Per-call path (like the report path) so env overrides apply even
+    # when this module was imported earlier by a different process/test.
+    db_path = Path(os.environ.get("TASKFENCE_DB", "taskfence.sqlite3"))
+    if not db_path.exists():
+        return metrics
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN decision = 'APPROVE' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN action = 'approval_resolve'"
+            " AND decision = 'ALLOW' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN decision NOT IN"
+            " ('ALLOW','BLOCK','APPROVE') OR reasons = ''"
+            " THEN 1 ELSE 0 END) FROM audit_events").fetchone()
+        metrics["events"], metrics["approval_gated"], \
+            metrics["one_time"], metrics["incomplete"] = (
+                row[0], row[1] or 0, row[2] or 0, row[3] or 0)
+        tasks = {r[0] for r in conn.execute(
+            "SELECT task_id FROM task_state")}
+        audited = {r[0] for r in conn.execute(
+            "SELECT DISTINCT task_id FROM audit_events")}
+        metrics["tasks_without_events"] = len(tasks - audited)
+        return metrics
+    except sqlite3.OperationalError:
+        return metrics
+    finally:
+        conn.close()
+
+
+def metrics_panel() -> None:
+    """Kit I7 security metrics — every number traces to a real source:
+    the generated scenario report or the stored audit log. Nothing here
+    re-derives policy outcomes or invents figures."""
+    st.subheader("SECURITY METRICS")
+    report = _scenario_report_metrics()
+    audit = _audit_metrics()
+    left, mid, right = st.columns(3)
+    left.metric(
+        "Scenarios reproduced",
+        report["scenarios"] if report["scenarios"] is not None
+        else "run scenarios.run_all")
+    mid.metric("Unauthorized flows intercepted",
+               report["unauthorized"] or "no report")
+    right.metric("Legitimate flows allowed",
+                 report["legitimate"] or "no report")
+    left2, mid2, right2 = st.columns(3)
+    left2.metric("Approval-gated flows", audit["approval_gated"])
+    mid2.metric("One-time approvals executed", audit["one_time"])
+    if audit["events"] == 0:
+        right2.metric("Audit coverage", "no stored session")
+    elif audit["incomplete"] == 0 and audit["tasks_without_events"] == 0:
+        right2.metric(
+            "Audit coverage",
+            f"{audit['events']}/{audit['events']} events",
+            help="Every stored audit event carries a decision and reasons, "
+                 "and every stored task has audit events. This is a "
+                 "structural check of the stored session, not a claim of "
+                 "universal coverage.")
+    else:
+        right2.metric(
+            "Audit coverage", "incomplete",
+            help=f"{audit['incomplete']} event(s) missing decision/reasons; "
+                 f"{audit['tasks_without_events']} task(s) without audit "
+                 "events.")
+    st.caption("Sources: reports/results.md (regenerate with "
+               "`python -m scenarios.run_all`) and this session's audit "
+               "log. The interception figure is a controlled MVP test "
+               "criterion, not a claim of universal security.")
 
 
 def _flow_dot(state: dict) -> str:
@@ -550,6 +666,8 @@ with right:
                if contract.get("parent_contract_id") else ""))
     else:
         st.info("No contract yet.")
+
+metrics_panel()
 
 scenario_d_panel()
 
