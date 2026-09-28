@@ -66,7 +66,7 @@ class ToolCallIn(BaseModel):
     args: dict = Field(default_factory=dict)
 
 
-def build_sales_reporting_contract(task_text: str) -> TaskContract:
+def build_task_contract(task_text: str) -> TaskContract:
     """Contract builder entry point (kit Prompt D1 wires the real builder
     in here; the deterministic keyword fallback keeps the demo alive when
     Ollama is down — DECISIONS §8)."""
@@ -257,7 +257,7 @@ def _finish(task_id: str, contract, request: FlowRequest, lineage: list[str],
 @app.post("/tasks")
 def create_task(body: TaskIn):
     task_id = f"task-{uuid.uuid4().hex[:12]}"
-    contract = build_sales_reporting_contract(body.task_text)
+    contract = build_task_contract(body.task_text)
     CONTRACTS[task_id] = contract
     TASK_TEXT[task_id] = body.task_text
     _save_state(task_id, contract)

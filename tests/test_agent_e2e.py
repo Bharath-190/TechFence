@@ -57,7 +57,7 @@ def test_build_contract_called_once_with_original_task_only(
     # The gateway imports build_contract inside the function, so patch the
     # module attribute the gateway resolves at call time:
     import taskfence.gateway as gw
-    monkeypatch.setattr(gw, "build_sales_reporting_contract", spy_build)
+    monkeypatch.setattr(gw, "build_task_contract", spy_build)
 
     ScriptedAgent(agent_client).run(
         "Summarize Q3 sales and post it to #sales.", "scenario_b")
