@@ -32,6 +32,11 @@ SCENARIOS = {
 }
 SCENARIO_TASK = "Summarize Q3 sales and post it to #sales."
 
+# Scenario D scope-expansion request (same shape the agent sends in
+# scenarios/scenario_d.py — the dashboard only TRIGGERS it).
+SCENARIO_D_ARGS = {"channel": "#sales", "text": "regional conversion: 42%",
+                   "source_assets": ["customer_db"]}
+
 
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -231,6 +236,125 @@ def _resolve(approval_id: str, choice: str) -> None:
         st.error(f"Gateway unreachable: {error}")
 
 
+def _run_scenario_d() -> dict | None:
+    """Kit I4: trigger the Scenario D scope-expansion request through the
+    real gateway API (the same request the agent sends) and return the
+    decision summary. The dashboard computes nothing about security —
+    every field below comes from the gateway response."""
+    try:
+        created = httpx.post(f"{GATEWAY}/tasks",
+                             json={"task_text": SCENARIO_TASK}, timeout=10)
+        created.raise_for_status()
+        task_id = created.json()["task_id"]
+        response = httpx.post(f"{GATEWAY}/tasks/{task_id}/tool-call",
+                              json={"tool": "send_slack",
+                                    "args": SCENARIO_D_ARGS}, timeout=10)
+        response.raise_for_status()
+        body = response.json()
+    except httpx.HTTPError as error:
+        st.error(f"Gateway unreachable: {error}")
+        return None
+    return {"task_id": task_id,
+            "outcome": body["decision"]["outcome"],
+            "agent_message": body.get("agent_message", ""),
+            "approval_id": body.get("approval_id")}
+
+
+def _fetch_approval_detail(approval_id: str) -> dict | None:
+    """Kit I4: the human preview, pulled from the gateway's admin-gated
+    approval-detail endpoint — the exact reviewed request, never
+    reconstructed or approximated in the dashboard."""
+    try:
+        response = httpx.get(
+            f"{GATEWAY}/approvals/{approval_id}",
+            headers={"X-Admin-Token": ADMIN_TOKEN}, timeout=10)
+    except httpx.HTTPError as error:
+        st.error(f"Gateway unreachable: {error}")
+        return None
+    if response.status_code != 200:
+        st.error(f"Approval detail failed: HTTP {response.status_code}")
+        return None
+    return response.json()
+
+
+def _resolve_allow_once(approval_id: str) -> dict | None:
+    """Resolve allow_once via the existing gateway endpoint, returning the
+    full response (executed flag, resulting decision, lineage path)."""
+    try:
+        response = httpx.post(
+            f"{GATEWAY}/approvals/{approval_id}/resolve",
+            json={"choice": "allow_once"},
+            headers={"X-Admin-Token": ADMIN_TOKEN}, timeout=10)
+    except httpx.HTTPError as error:
+        st.error(f"Gateway unreachable: {error}")
+        return None
+    if response.status_code != 200:
+        st.error(f"Resolve failed: HTTP {response.status_code}")
+        return None
+    return response.json()
+
+
+def scenario_d_panel() -> None:
+    """Kit I4 guided walkthrough: Run Scenario D → APPROVE + approval_id →
+    approval preview from the real detail endpoint → Allow Once → the
+    resulting ALLOW. The LIVE FLOW / LINEAGE panel and the AUDIT TRAIL
+    render after this section, so the approved execution is visible
+    immediately (and the fragment refreshes every 2s besides)."""
+    run = (st.session_state["scenario_d"]
+           if "scenario_d" in st.session_state else None)
+    if not run:
+        return
+    st.subheader("SCENARIO D — APPROVAL WALKTHROUGH")
+    outcome = run.get("outcome", "?")
+    color = OUTCOME_COLOR.get(outcome, "#c62828")
+    st.markdown(
+        f"Scope-expansion request decision: "
+        f"**<span style='color:{color}'>{outcome}</span>**",
+        unsafe_allow_html=True)
+    st.markdown(f"Task: `{run.get('task_id')}`")
+    approval_id = run.get("approval_id")
+    if not approval_id:
+        st.info(run.get("agent_message", "no approval pending"))
+        return
+    st.markdown(f"Approval ID: `{approval_id}`")
+    if st.button("Open approval preview", key="d-open-preview"):
+        st.session_state["d_preview"] = _fetch_approval_detail(approval_id)
+    preview = (st.session_state["d_preview"]
+               if "d_preview" in st.session_state else None)
+    if preview:
+        st.markdown(
+            f"Reviewed tool: **{preview['tool']}** · action "
+            f"`{preview['action']}` → `{preview['destination']}`  \n"
+            f"Source/data: "
+            f"**{', '.join(preview['declared_source_groups']) or '—'}**"
+            f" · full source groups: "
+            f"**{', '.join(preview['source_groups']) or '—'}**  \n"
+            f"Contract: `{preview['contract_id']}` @ "
+            f"`{preview['contract_version']}`")
+        st.caption("Exact tool arguments (verbatim from the approval "
+                   "response):")
+        st.code(json.dumps(preview["tool_args"], indent=2, sort_keys=True),
+                language=None)
+        st.caption("Exact outbound payload:")
+        st.code(str(preview["payload"]), language=None)
+    if st.button("Allow Once", key="d-allow-once"):
+        st.session_state["d_resolved"] = _resolve_allow_once(approval_id)
+    resolved = (st.session_state["d_resolved"]
+               if "d_resolved" in st.session_state else None)
+    if resolved:
+        after = (resolved.get("decision") or {}).get("outcome", "?")
+        color_after = OUTCOME_COLOR.get(after, "#c62828")
+        st.markdown(
+            f"After resolution: **<span style='color:{color_after}'>"
+            f"{after}</span>** — executed: **{resolved.get('executed')}**",
+            unsafe_allow_html=True)
+        if resolved.get("lineage_path"):
+            st.caption("Approved-execution lineage: "
+                       + " → ".join(resolved["lineage_path"]))
+        st.caption("LIVE FLOW, LINEAGE and AUDIT TRAIL below now include "
+                   "the approved execution.")
+
+
 st.title("🛡️ TASKFENCE")
 st.caption("Purpose-Bound Security for AI Agents — "
            "the agent decides HOW; TaskFence decides WHETHER.")
@@ -244,6 +368,15 @@ with st.sidebar:
                 [sys.executable, "-m", "taskfence.agent",
                  "--task", SCENARIO_TASK, "--scripted", script])
             st.toast(f"Started {script}")
+    st.divider()
+    st.caption("Guided approval demo")
+    if st.button("Run Scenario D — approval walkthrough"):
+        result = _run_scenario_d()
+        if result:
+            st.session_state["scenario_d"] = result
+            st.session_state["d_preview"] = None
+            st.session_state["d_resolved"] = None
+            st.toast(f"Scenario D request: {result['outcome']}")
     st.divider()
     if st.button("♻️ Reset DB + outbox"):
         conn = _db()
@@ -289,6 +422,8 @@ with right:
                if contract.get("parent_contract_id") else ""))
     else:
         st.info("No contract yet.")
+
+scenario_d_panel()
 
 live_panel()
 
