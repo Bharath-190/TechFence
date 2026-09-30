@@ -13,6 +13,7 @@ Invariant I1: this module imports taskfence.client only — never
 taskfence.tools. CLI:
   python -m taskfence.agent --task "..." --scripted scenario_a
   python -m taskfence.agent --task "..."
+  python -m taskfence.agent --task "..." --mcp   # MCP-routed Ollama loop
 """
 
 import argparse
@@ -171,6 +172,120 @@ class OllamaAgent:
         return transcript, "Stopped at max steps without finishing."
 
 
+class McpAgent:
+    """MCP-routed Ollama loop (MCP extension kit, Person 3 / M2).
+
+    Same loop contract as OllamaAgent — temperature 0, MAX_STEPS guard,
+    stop-on-BLOCK/APPROVE, never retry a denied call — but every protected
+    tool call travels through the MCP adapter (mcp_gateway.server), which
+    forwards it to the gateway. Tool discovery is DYNAMIC (tools/list from
+    the MCP server); the schema conversion is done by taskfence.mcp_client.
+    The task is created through the existing GatewayClient (requirement 2:
+    existing contract-building logic), and its task_id threads through MCP
+    (adapter D12). No second decision path exists: outcomes come from the
+    gateway via the adapter, verbatim.
+    """
+
+    def __init__(self, client: GatewayClient, model: str | None = None,
+                 base_url: str | None = None, max_steps: int = MAX_STEPS,
+                 bridge=None) -> None:
+        self.client = client
+        self.model = model or os.environ.get("TASKFENCE_MODEL", "qwen3")
+        self.base_url = (base_url or os.environ.get(
+            "TASKFENCE_OLLAMA_URL", "http://localhost:11434")).rstrip("/")
+        self.max_steps = max_steps
+        self._bridge = bridge  # injectable for tests (mocked MCP client)
+        # Thinking models can exceed the default 60 s per tool-calling
+        # round; configurable for slow local hardware (default unchanged).
+        self.chat_timeout = float(
+            os.environ.get("TASKFENCE_CHAT_TIMEOUT", "60"))
+
+    def _chat(self, messages: list[dict], tools: list[dict]) -> dict:
+        """One Ollama /api/chat round-trip (same seam as OllamaAgent)."""
+        response = httpx.post(
+            f"{self.base_url}/api/chat",
+            json={"model": self.model, "stream": False,
+                  "options": {"temperature": 0},
+                  "messages": messages, "tools": tools},
+            timeout=self.chat_timeout)
+        response.raise_for_status()
+        return response.json()
+
+    async def _run_async(self, task_text: str) -> tuple[list[dict], str]:
+        from taskfence.mcp_client import McpToolBridge
+
+        bridge = self._bridge if self._bridge is not None else McpToolBridge()
+        owns_bridge = self._bridge is None
+        try:
+            if owns_bridge:
+                bridge = await bridge.__aenter__()
+            return await self._loop(bridge, task_text)
+        finally:
+            if owns_bridge:
+                await bridge.__aexit__(None, None, None)
+
+    async def _loop(self, bridge, task_text: str) -> tuple[list[dict], str]:
+        # Requirement 2: the Task Contract is built by the EXISTING gateway
+        # logic via the existing client — never inside the agent or adapter.
+        task_id = self.client.create_task(task_text)["task_id"]
+        messages = [
+            {"role": "system", "content":
+                "You complete the user's task using the provided tools. "
+                "Security policy is enforced by the TaskFence gateway, not "
+                "by you. If a tool call is denied or needs approval, stop "
+                "and report it; never retry a denied call."},
+            {"role": "user", "content": task_text},
+        ]
+        tool_specs = bridge.ollama_tool_specs()
+        transcript: list[dict] = []
+        for _ in range(self.max_steps):  # same max-step guard as OllamaAgent
+            data = self._chat(messages, tool_specs)
+            message = data.get("message", {})
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                return transcript, message.get("content", "")
+            for call in tool_calls:
+                function = call.get("function", {})
+                name = function.get("name", "")
+                args = function.get("arguments", {}) or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                # The ONLY tool-execution path in this agent: MCP.
+                response = await bridge.call_tool(task_id, name, args)
+                decision = response.get("decision")
+                if decision is None:  # adapter fail-closed (D13)
+                    detail = response.get("detail", "gateway unavailable")
+                    transcript.append({"tool": name, "decision": "ERROR",
+                                       "agent_message": detail})
+                    return transcript, f"Gateway unavailable: {detail}"
+                agent_message = response.get("agent_message", "")
+                transcript.append({"tool": name, "decision": decision,
+                                   "agent_message": agent_message})
+                messages.append({"role": "assistant", "content": json.dumps(
+                    {"tool": name, "arguments": args})})
+                if decision in ("BLOCK", "APPROVE"):
+                    # BLOCK: the real denial, never retried. APPROVE:
+                    # approval_id + human instructions, never claimed as
+                    # execution, never waited on (kit requirement 9).
+                    note = ""
+                    if decision == "APPROVE" and response.get("approval_id"):
+                        note = (f" (approval_id: {response['approval_id']})")
+                    messages.append({"role": "tool",
+                                     "content": agent_message + note})
+                    return transcript, agent_message + note
+                messages.append({"role": "tool",
+                                 "content": json.dumps(
+                                     response.get("result", {}))})
+        return transcript, "Stopped at max steps without finishing."
+
+    def run(self, task_text: str) -> tuple[list[dict], str]:
+        from taskfence.mcp_client import run_async
+        return run_async(self._run_async(task_text))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TaskFence demo agent")
     parser.add_argument("--task", required=True,
@@ -178,6 +293,10 @@ def main() -> None:
     parser.add_argument("--scripted", default=None,
                         help="replay a scripted flow: "
                              + ", ".join(sorted(SCRIPTS)))
+    parser.add_argument("--mcp", action="store_true",
+                        help="route tool calls through the local MCP "
+                             "gateway (Ollama loop; requires the gateway "
+                             "and mcp_gateway server)")
     args = parser.parse_args()
     client = GatewayClient()
     if args.scripted:
@@ -190,6 +309,13 @@ def main() -> None:
             # the gateway — this only re-prints the response field.
             if step["decision"] in ("BLOCK", "APPROVE"):
                 print(step["agent_message"])
+        return
+    if args.mcp:
+        agent = McpAgent(client)
+        transcript, final = agent.run(args.task)
+        for step in transcript:
+            print(f"{step['tool']}: {step['decision']}")
+        print(final)
         return
     agent = OllamaAgent(client)
     transcript, final = agent.run(args.task)
