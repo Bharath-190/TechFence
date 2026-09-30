@@ -6,5 +6,6 @@ streamlit
 requests
 httpx
 pytest
+mcp==2.2.0
 # ollama runs as an external local service; the optional real-model tests
 # use plain httpx against localhost:11434, so no extra client package needed.
