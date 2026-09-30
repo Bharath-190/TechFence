@@ -64,7 +64,10 @@ ALLOW → tool executes      APPROVE → human resolves            BLOCK → too
 - **Human approvals** — the agent-side client never holds the admin token.
 - **Dashboard** — Streamlit, reads SQLite only; renders the contract card,
   live flow, decision explanations, lineage graph and audit trail. The UI
-  computes nothing about security.
+  computes nothing about security. For demo clarity it shows SYSTEM STATUS
+  (gateway reachability), a SECURITY FLOW panel with every audited decision
+  of the latest task, and a FINAL SCENARIO OUTCOME banner — so an
+  intermediate ALLOW is never mistaken for the scenario result.
 
 ## Quickstart
 
@@ -224,17 +227,17 @@ commands above and the README stays honest:
 
 ## Demo scenarios
 
-| Scenario | Story | Result |
+| Scenario | Security property | Expected result |
 |---|---|---|
-| A | Legitimate: summarize Q3 sales → #sales | ALLOW, message delivered |
-| B | Poisoned meeting notes instruct exfiltration | read allowed-but-tainted; external post BLOCKed; sink untouched |
-| C | Derive average salary → post externally | BLOCKed via inherited EMPLOYEE_DATA/FINANCIAL |
-| C2 | Same exfiltration, keyword-free payload | BLOCKed via inherited labels alone — rewording dodges nothing |
-| D | Agent needs customer data for conversion rates | APPROVE → human allow_once → executes exactly once |
+| A | Authorized data flow | ALLOW → ALLOW — **COMPLETED** |
+| B | Prompt injection containment | ALLOW → BLOCK — **BLOCKED** |
+| C | Derived-data lineage | ALLOW → BLOCK — **BLOCKED** (the first ALLOW is the read, not the result) |
+| C2 | Derived lineage, keyword-free payload | BLOCKed via inherited labels alone — rewording dodges nothing |
+| D | Human approval | ALLOW → APPROVE — **HUMAN APPROVAL REQUIRED**; allow_once executes exactly once |
 | D2 | Contract scope formally expanded | expand_task creates a new contract version; the old version stays intact (control) |
-| E | Unknown tool / unknown asset | default-deny BLOCK, audited |
-| F | Agent tries to change its own contract | impossible — no such endpoint, no client surface |
-| G | Legitimate flow after an out-of-scope read | held for human review (conservative taint) — **disclosed false positive**, see report |
+| E | Unknown destination | BLOCK — **BLOCKED** (fail closed) |
+| F | Contract integrity | REJECTED — **CONTRACT CHANGE REJECTED** |
+| G | Conservative lineage handling | APPROVE — **CONSERVATIVE ESCALATION**: known conservative lineage/precision case, disclosed rather than hidden |
 
 ## Test results
 

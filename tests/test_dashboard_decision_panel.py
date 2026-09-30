@@ -43,7 +43,10 @@ def test_panel_renders_all_six_fields_from_stored_state(seeded_db):
 
     # The five required sections exist, clearly separated:
     headers = [subheader.value for subheader in at.subheader]
-    assert "CURRENT DECISION" in headers
+    # Phase 7 (demo clarity): the header now reads CURRENT SECURITY
+    # DECISION to distinguish the intermediate decision from the FINAL
+    # SCENARIO OUTCOME rendered by the SECURITY FLOW panel.
+    assert "CURRENT SECURITY DECISION" in headers
     assert "AUDIT TRAIL" in headers
     assert "CURRENT TASK" in headers
     assert "CONTRACT SCOPE" in headers
@@ -71,7 +74,7 @@ def test_panel_is_absent_without_state_and_db_stays_graceful(tmp_path,
     at = _run_app()
     assert not at.exception, at.exception
     headers = [subheader.value for subheader in at.subheader]
-    assert "CURRENT DECISION" in headers          # section always present
+    assert "CURRENT SECURITY DECISION" in headers  # section always present
     assert "No decision yet" in " ".join(
         info.value for info in at.info)           # graceful empty state
 

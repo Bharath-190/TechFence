@@ -41,24 +41,52 @@ Click **Scenario B — injected agent (poisoned notes)**.
 
 Click **Scenario C — derived salary bypass**.
 
+- Read the WHAT THIS SCENARIO PROVES card aloud: transforming sensitive
+  information does not remove the restrictions inherited from its source.
 - "The agent averaged salaries. An average isn't the spreadsheet — DLP might
   see an innocent number."
-- BLOCK again. Point at LINEAGE: `employee_salary → salary_summary →
-  external_api`. "Derived data inherits its source's restrictions."
+- BLOCK again. Point at SECURITY FLOW: `Step 1 read_file ALLOW` — "the first
+  ALLOW is only the READ" — then `Step 2 post_external BLOCK`, and the
+  FINAL SCENARIO OUTCOME banner: **BLOCKED**. Point at LINEAGE:
+  `employee_salary → salary_summary → external_api`. "Derived data
+  inherits its source's restrictions."
 - Mention C2 in the report: the payload was `'Quarterly aggregate: 42'` —
   **zero salary keywords** — and it still blocked. "This is lineage, not
   keyword matching."
 
 ## Beat 4 — humans stay in the loop (Scenario D + approvals) ~60s
 
-Trigger a customer-data request (Scenario D script or a direct call): the
-dashboard shows the amber **APPROVE** banner.
+Run **Run Scenario D — approval walkthrough** in the sidebar: the dashboard
+shows **HUMAN APPROVAL REQUIRED** as the FINAL SCENARIO OUTCOME.
 
-- Click **Allow Once**: the message executes — once. The identical request
+- Open the approval preview: the exact held request (tool, destination,
+  declared source groups, full payload) and the reviewed contract binding.
+- Click **Allow Once**: the message executes — once — and the outcome
+  becomes **COMPLETED — AFTER HUMAN APPROVAL**. The identical request
   needs approval again (single-use).
 - Mention expand_task: "Or the human widens the contract — a new version,
   old one untouched. The agent can propose; only a human resolves; the agent
   never holds the token." (Self-resolution returns 403.)
+
+## Beat 4b — fail-closed boundaries (Scenarios E and F) ~45s
+
+Run **Scenario E — unknown destination (default deny)**: FINAL SCENARIO
+OUTCOME **BLOCKED** — "an unknown destination is not automatically
+trusted; TaskFence fails closed."
+
+Run **Scenario F — contract tamper attempt (impossible)**: **CONTRACT
+CHANGE REJECTED** — "the agent controls HOW it performs a task, but cannot
+redefine WHAT it is authorized to do. There is no contract-mutating
+endpoint at all."
+
+## Beat 4c — the honest edge (Scenario G) ~30s
+
+Run **Scenario G — precision check (known false positive)**: SECURITY FLOW
+shows the read ALLOWs and the outbound **APPROVE**; the banner reads
+**CONSERVATIVE ESCALATION**. "This is the known conservative
+lineage/precision case — TaskFence escalates to a human rather than
+silently allowing a flow it cannot prove safe. We disclose it; we don't
+tune it away for the demo."
 
 ## Beat 5 — honesty close (report) ~30s
 

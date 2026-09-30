@@ -203,13 +203,33 @@ def _handle_outbound(task_id: str, contract, tool: str, meta: dict,
                    decision, tool_args=args, declared=declared)
 
 
-def _save_state(task_id: str, contract) -> None:
-    """Persist live task state for the dashboard process (display only)."""
-    if task_id not in CONTRACTS:
+def _stored_task_text(task_id: str) -> str:
+    """Task text for audit/state DISPLAY: the live map first, then the
+    stored audit trail (which survives gateway restarts). Display data
+    only — never a security input; decisions come from the frozen
+    approval binding, never from reconstructed task text (FIX1)."""
+    text = TASK_TEXT.get(task_id)
+    if text:
+        return text
+    events = AUDIT.read_all(task_id)
+    return events[-1].get("task_text", "") if events else ""
+
+
+def _save_state(task_id: str, contract=None) -> None:
+    """Persist live task state for the dashboard process (display only).
+
+    `contract` defaults to the task's live contract. Resolving a PERSISTED
+    approval after a gateway restart passes the REVIEWED frozen contract
+    explicitly — the exact contract the human reviewed — so the stored
+    state still reflects the resolution. This is display data only; it
+    never substitutes the reviewed snapshot in any security decision."""
+    if contract is None:
+        contract = CONTRACTS.get(task_id)
+    if contract is None:
         return
     STATE.save(task_id, {
-        "task_text": TASK_TEXT.get(task_id, ""),
-        "contract": CONTRACTS[task_id].model_dump(),
+        "task_text": _stored_task_text(task_id),
+        "contract": contract.model_dump(),
         "last_decision": LAST_DECISION.get(task_id),
         "session_reads": sorted(TRACKER.session_reads.get(task_id, set())),
         "pending_approvals": APPROVALS.pending(task_id)})
@@ -333,6 +353,27 @@ def _reviewed_binding(record: dict) -> tuple[TaskContract, FlowRequest]:
 @app.post("/approvals/{approval_id}/resolve")
 def resolve_approval(approval_id: str, body: ResolveIn,
                      request: Request):
+    """Human-only resolution (FIX1), restart-safe for persisted approvals.
+
+    The approval record itself carries the complete frozen reviewed
+    binding — contract snapshot + id/version, the EXACT original tool
+    args, the stored FlowRequest snapshot and the declared sources — so
+    `deny` and `allow_once` NEVER require the in-memory CONTRACTS map.
+    A gateway restart wipes CONTRACTS/TASK_TEXT but SQLite keeps the
+    approval; a legitimately persisted approval must stay resolvable
+    using exactly its reviewed binding (no fallback to any current/live
+    contract, no reconstruction from task text).
+
+    All FIX1 fail-closed checks run BEFORE the approval is claimed or
+    anything executes, exactly as before: missing/invalid snapshot,
+    id/version mismatch, missing exact tool args, unknown tool,
+    unresolvable source asset -> 409, status stays pending, nothing runs.
+
+    expand_task is different by nature: it issues a NEW contract version
+    for the task's LIVE session (I3), so it still requires the task to be
+    active in this gateway process — after a restart there is no live
+    session to expand, and the record is left pending.
+    """
     _require_admin(request)
     record = APPROVALS.get(approval_id)
     if record is None:
@@ -340,15 +381,14 @@ def resolve_approval(approval_id: str, body: ResolveIn,
     if record["status"] != "pending":
         raise HTTPException(status_code=409, detail="already resolved")
     task_id = record["task_id"]
-    if task_id not in CONTRACTS:
-        raise HTTPException(status_code=404, detail="unknown task")
+    task_is_live = task_id in CONTRACTS
 
     if body.choice == "deny":
         # Deny executes nothing; it stays available even for records with a
         # broken binding so the human can always reject them.
         APPROVALS.set_status(approval_id, "denied")
         _audit_event(task_id, {
-            "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
+            "task_id": task_id, "task_text": _stored_task_text(task_id),
             "contract_id": record.get("contract_id") or "",
             "contract_version": record.get("contract_version") or "",
             "tool": record["tool"], "action": "approval_resolve",
@@ -416,9 +456,14 @@ def resolve_approval(approval_id: str, body: ResolveIn,
             "explain": explain(decision, stored, reviewed, lineage),
             "lineage_path": lineage, "tool": stored.tool,
             "destination": stored.destination}
-        _save_state(task_id, CONTRACTS[task_id])
+        # Restart-safe: pass the REVIEWED frozen contract explicitly. When
+        # the task is live this is identical to CONTRACTS[task_id]; when it
+        # is not, the persisted resolution still updates the stored task
+        # state (display only) instead of silently skipping it.
+        _save_state(task_id, reviewed)
         _audit_event(task_id, {
-            "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
+            "task_id": task_id,
+            "task_text": _stored_task_text(task_id),
             "contract_id": reviewed.contract_id,
             "contract_version": reviewed.version,
             "tool": record["tool"], "action": "approval_resolve",
@@ -435,6 +480,14 @@ def resolve_approval(approval_id: str, body: ResolveIn,
     # FIX1-E: bound to the REVIEWED contract version; the grant set comes
     # ONLY from the request's originally DECLARED source groups — never
     # from session-taint source_groups. No declared group => fail closed.
+    # Expansion belongs to the task's LIVE session: it installs the new
+    # version as the current contract (CONTRACTS), so after a gateway
+    # restart there is no live session to expand — fail closed (409) with
+    # the record left pending rather than fabricating a session.
+    if not task_is_live:
+        raise _fail_closed(
+            "task is not active in this gateway process; restart-safe "
+            "resolution supports deny and allow_once only")
     reviewed, stored = _reviewed_binding(record)
     declared_assets = list(record.get("declared_source_assets") or [])
     declared_groups = sorted({
@@ -460,7 +513,8 @@ def resolve_approval(approval_id: str, body: ResolveIn,
     CONTRACTS[task_id] = new_contract
     _save_state(task_id, new_contract)
     _audit_event(task_id, {
-        "task_id": task_id, "task_text": TASK_TEXT.get(task_id, ""),
+        "task_id": task_id,
+        "task_text": _stored_task_text(task_id),
         "contract_id": new_contract.contract_id,
         "contract_version": new_contract.version,
         "tool": record["tool"], "action": "approval_resolve",
