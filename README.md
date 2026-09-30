@@ -2,6 +2,39 @@
 
 **Track 3 — Cybersecurity & Defense · ASYNC'26**
 
+![Status](https://img.shields.io/badge/status-hackathon%20MVP-lightgrey)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![License](https://img.shields.io/badge/license-not%20yet%20declared-red)
+
+## Status
+
+| | |
+|---|---|
+| Maturity | Hackathon MVP — local demo prototype, **not** production-ready |
+| Language | Python 3.11+ (developed and tested on Python 3.14) |
+| Deterministic test suite | **272 passed, 2 deselected** (2 optional live checks excluded by default) |
+| Real model path (Ollama/Qwen3) | Optional — every feature works without it via the deterministic fallback |
+| Automated CI | Not currently configured |
+| License | No open-source license is currently declared |
+
+## Demo
+
+**Live dashboard:** https://techfence.streamlit.app/
+
+**Repository:** https://github.com/Bharath-190/TechFence
+
+The live demo drives the same gateway pipeline through all seven scenario
+flows (see the scenario table below): A — legitimate authorized flow, B —
+prompt injection containment, C — derived-data lineage, D — human approval,
+E — unknown destination, F — contract integrity, G — conservative lineage
+handling. Every decision, the full security flow, the final outcome and the
+append-only audit trail are shown as the gateway records them.
+
+No screenshots or videos are committed to this repository yet; the live
+demo is the canonical walkthrough, and `docs/DEMO_SCRIPT.md` is the
+minute-by-minute narration. Deeper documentation: `docs/JUDGE_QA.md`,
+`docs/INVARIANTS.md`, `specs/DECISIONS.md`, `specs/MCP_DECISIONS.md`.
+
 TaskFence is a runtime security gateway for AI agents. It sits between an
 autonomous agent and the tools/data sources it can use. When a user starts a
 task, TaskFence creates a **Task Contract** — purpose, permitted data, actions
@@ -46,6 +79,31 @@ ALLOW → tool executes      APPROVE → human resolves            BLOCK → too
                             X-Admin-Token; agent gets 403)
 ```
 
+The same flow as a rendered diagram (GitHub renders Mermaid natively):
+
+```mermaid
+flowchart TD
+    U[User Task] --> C[Task Contract — frozen, built from task text only]
+    C --> A[AI Agent — Scripted / Ollama-Qwen3 / MCP-routed]
+    A --> M[GatewayClient / MCP adapter — the only agent-side path]
+    M --> G[TaskFence Gateway]
+    G --> CL[Classification]
+    CL --> L[Lineage taint]
+    L --> P[Policy Engine — deterministic, default deny]
+    P --> D{Decision}
+    D -->|ALLOW| T[Tool executes — fake sinks / optional real Slack webhook]
+    D -->|APPROVE| H[Human review — allow_once / expand_task / deny]
+    H -->|allow_once: exact replay of the approved request| G
+    D -->|BLOCK| X[Tool never runs]
+    T --> AU[(Append-only audit trail — SQLite)]
+    H --> AU
+    P --> AU
+    AU -.-> DA[Streamlit dashboard — reads stored evidence only]
+```
+
+The dashboard (`:8501`) is a separate process that reads SQLite and the
+generated reports only — it computes nothing about security.
+
 ### Key security properties
 
 - **Enforcement outside the agent** — every decision happens in the
@@ -69,11 +127,24 @@ ALLOW → tool executes      APPROVE → human resolves            BLOCK → too
   of the latest task, and a FINAL SCENARIO OUTCOME banner — so an
   intermediate ALLOW is never mistaken for the scenario result.
 
-## Quickstart
+## Installation & configuration
 
-Requires Python 3.11+. No paid cloud LLM API is used; everything runs locally.
+### Prerequisites
+
+- Python 3.11+ (developed and tested on Python 3.14)
+- Git
+- Optional: [Ollama](https://ollama.com) with `qwen3` pulled — the real-model
+  path; everything works without it via the deterministic fallback
+- Optional: one Slack incoming webhook for real (flag-gated) delivery
+
+No paid APIs, no cloud infrastructure, no GPU requirement, and no Docker
+image is published or required — everything runs locally.
+
+### Step by step
 
 ```bash
+git clone https://github.com/Bharath-190/TechFence.git
+cd TechFence
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ./run_demo.sh          # resets state, starts gateway :8000 + dashboard :8501
@@ -91,6 +162,28 @@ TASKFENCE_ADMIN_TOKEN=devtoken .venv/bin/streamlit run dashboard/app.py
 .venv/bin/python -m taskfence.agent --task "Summarize Q3 sales and post it to #sales." --scripted scenario_a
 .venv/bin/python -m taskfence.agent --task "Summarize Q3 sales and post it to #sales." --scripted scenario_b
 ```
+
+### Environment variables
+
+Every variable below is read by the code (verified in source); all have
+safe defaults and every one is optional.
+
+| Variable | Read by | Default | Purpose |
+|---|---|---|---|
+| `TASKFENCE_URL` | agent, MCP adapter, dashboard, scenario replays | `http://localhost:8000` | Base URL of the running TaskFence gateway |
+| `TASKFENCE_ADMIN_TOKEN` | gateway (enforces), dashboard (sends) | unset — resolution returns 403 | Human-only admin token for approval resolution (allow_once / expand_task / deny). The agent-side client never holds it |
+| `TASKFENCE_OLLAMA_URL` | contract builder (gateway), agents | `http://localhost:11434` | Local Ollama URL. Point it at an unreachable URL (e.g. `http://127.0.0.1:1`) to force the deterministic fallback contract path |
+| `TASKFENCE_MODEL` | contract builder, Ollama/MCP agents | `qwen3` | Local model name |
+| `TASKFENCE_CHAT_TIMEOUT` | MCP agent | `60` | Seconds per model chat round (thinking models can be slow) |
+| `TASKFENCE_MCP_TIMEOUT` | MCP adapter | `30` | Fail-closed gateway timeout for MCP tool calls |
+| `TASKFENCE_REAL_SLACK_WEBHOOK` | gateway process (executes tools) | unset — fake sinks only | ONE Slack incoming webhook for real delivery. **Secret:** never commit, never log; see `mcp_gateway/README.md` |
+| `TASKFENCE_DB` | dashboard (display reads) | `taskfence.sqlite3` | SQLite path the dashboard reads; the gateway itself uses `taskfence.sqlite3` in its working directory (keep both in one CWD, as `run_demo.sh` does) |
+| `TASKFENCE_REPORT_PATH` | dashboard metrics panel | `reports/results.md` | Generated scenario report to display |
+| `TASKFENCE_MCP_EVIDENCE_PATH` | dashboard MCP panel | `reports/mcp_evidence.json` | Generated MCP evidence to display |
+
+The MCP adapter spawns its server subprocess with an environment
+allowlist (`PATH`, `HOME`, `PYTHONPATH`, `TASKFENCE_URL`,
+`TASKFENCE_OLLAMA_URL`) — nothing else leaks into it.
 
 ### Optional: the real local model
 
@@ -278,6 +371,69 @@ TASKFENCE_OLLAMA_URL=http://127.0.0.1:1 .venv/bin/pytest -q
 The two deselected tests are the optional live Ollama smoke test and the
 optional live Slack webhook delivery (`live_integration`), both excluded
 from the deterministic suite by `pytest.ini`.
+
+## Testing & QA
+
+No CI service is configured; run the suite locally:
+
+```bash
+# Full deterministic suite (no Ollama needed):
+TASKFENCE_OLLAMA_URL=http://127.0.0.1:1 .venv/bin/pytest -q
+# → 272 passed, 2 deselected
+
+# MCP adapter / agent / scenario / real-Slack tests:
+.venv/bin/pytest -q tests/test_mcp_adapter.py tests/test_agent_mcp.py \
+    tests/test_mcp_scenarios.py tests/test_mcp_real_integration.py
+
+# Optional live checks (both skip themselves when their service is absent):
+.venv/bin/pytest -m ollama -q             # real Qwen3 path via Ollama
+.venv/bin/pytest -m live_integration -q   # real Slack webhook delivery
+
+# Generated evidence (regenerates reports/results.md and mcp_evidence.json):
+.venv/bin/python -m scenarios.run_all
+.venv/bin/python -m scenarios.mcp_runner
+
+# Copy/claims lint (banned security claims) and whitespace hygiene:
+.venv/bin/pytest -q tests/test_copy_claims.py
+git diff --check
+```
+
+The two deselected tests are the optional live Ollama and live Slack
+checks (excluded by `pytest.ini`); both skip with an explicit reason when
+run directly without their service.
+
+## Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| Dashboard shows `SCENARIO EXECUTION FAILED — Gateway unavailable` | The gateway is not running. Start it first (`./run_demo.sh` handles ordering); the SYSTEM STATUS panel shows reachability. The dashboard never fabricates a decision |
+| `Gateway unreachable: timed out` during approvals | A reachable Ollama makes every contract draft take ~20 s. `run_demo.sh` pins the deterministic contract path; to demo the live-model path, start the gateway manually without the pin and expect the latency |
+| `TaskFence gateway port 8000 is already in use` | `run_demo.sh` fails fast on purpose so the dashboard never attaches to a stale gateway. Stop the existing gateway first |
+| `Resolve failed: HTTP 409` on Allow Once | Single-use by design: that approval already executed or was denied. Persisted approvals also resolve after a gateway restart |
+| Deterministic tests time out when Ollama is running | Contract drafting hits the real model. Run the suite with `TASKFENCE_OLLAMA_URL=http://127.0.0.1:1` |
+| Dashboard shows `No decision yet` | Run a scenario from the sidebar; the security flow refreshes within ~2 s |
+
+## Security reporting
+
+This is a hackathon prototype: there is no dedicated security-contact
+email or formal responsible-disclosure process yet. Please open a GitHub
+issue on the repository for anything you find. No security certifications
+are claimed; the prototype gateway is not hardened (see Limitations).
+
+## Contributing
+
+This is a hackathon MVP: there is no formal `CONTRIBUTING.md` or
+contributor policy yet. Issues and pull requests are welcome on GitHub.
+Constraints for any change: keep the policy engine deterministic, keep
+agents on the GatewayClient boundary (see `docs/INVARIANTS.md`), and keep
+the security tests green. No formatter/linter configuration is currently
+committed.
+
+## License
+
+No open-source license is currently declared. All rights remain with the
+repository owner until a license is added; do not redistribute under an
+assumed license.
 
 ## Stack
 
