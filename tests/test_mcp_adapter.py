@@ -35,18 +35,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_dashboard_scenario_d import real_gateway  # noqa: E402,F401
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVER_CMD = str(REPO_ROOT / ".venv" / "bin" / "python")
+# The interpreter RUNNING this suite: portable across venv layouts
+# (Windows .venv/Scripts vs POSIX .venv/bin) and always the one with the
+# mcp SDK + taskfence installed.
+SERVER_CMD = sys.executable
 TASK = "Summarize Q3 sales and post it to #sales."
 EXPECTED_TOOLS = {"read_file", "search_drive", "query_crm", "send_slack",
                   "post_external"}
 
 
 def _env(base_url: str) -> dict:
-    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "HOME": os.environ.get("HOME", "/tmp"),
-            "PYTHONPATH": str(REPO_ROOT),
-            "TASKFENCE_URL": base_url,
-            "TASKFENCE_MCP_TIMEOUT": "10"}
+    # Full environment passthrough (Windows needs SYSTEMROOT etc. for
+    # ssl/socket in the spawned interpreter), overridden with the
+    # test-specific settings.
+    env = dict(os.environ)
+    env.update({"PYTHONPATH": str(REPO_ROOT),
+                "TASKFENCE_URL": base_url,
+                "TASKFENCE_MCP_TIMEOUT": "10"})
+    return env
 
 
 def _mcp(base_url: str, tool: str, args: dict) -> dict:

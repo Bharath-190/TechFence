@@ -9,7 +9,9 @@ DATA_DIR = Path("data")
 
 
 def test_every_file_under_data_is_registered():
-    files = {str(p.relative_to(DATA_DIR)) for p in registry.data_files()
+    # as_posix(): compare against the /-joined registry paths identically
+    # on every OS (Windows Path separators would otherwise double-count).
+    files = {p.relative_to(DATA_DIR).as_posix() for p in registry.data_files()
              if p.name != "README.txt"}
     registered = {entry[0] for entry in registry.ASSETS.values()}
     assert files == registered, files ^ registered
