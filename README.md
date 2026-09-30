@@ -123,6 +123,76 @@ hardcoded, committed or logged, and never written to audit payloads or
 sink records. Normal tests never touch the real network; the single live
 check is deselected by default (`pytest -m live_integration`).
 
+## MCP Gateway (optional MCP extension)
+
+TaskFence also speaks MCP (Model Context Protocol), so MCP-capable AI
+agents reach the **same** gateway. The MCP layer is an **adapter, not a
+second security engine**: it holds no policy logic, never decides
+ALLOW/APPROVE/BLOCK and never executes tools directly — every protected
+call is evaluated by the existing gateway pipeline and the real outcome
+is returned verbatim (design decisions: `specs/MCP_DECISIONS.md`;
+implementation: `mcp_gateway/`, pinned `mcp==2.2.0`).
+
+```text
+Real AI agent  (Ollama/Qwen3 loop: python -m taskfence.agent --mcp)
+      ↓  MCP over stdio (official mcp SDK)
+TaskFence MCP gateway  (mcp_gateway.server — adapter ONLY)
+      ↓  GatewayClient / HTTP — the same boundary every agent uses
+TaskFence gateway  (the ONLY security authority)
+      ↓  real Decision + audit + gateway-side execution
+ALLOW / APPROVE / BLOCK
+```
+
+### Local setup
+
+```bash
+# terminal 1 — the security authority
+TASKFENCE_ADMIN_TOKEN=devtoken .venv/bin/uvicorn taskfence.gateway:app --port 8000
+# terminal 2 — the MCP adapter (stdio; used by any MCP client or the agent)
+.venv/bin/python -m mcp_gateway.server
+# terminal 3 — the real-model MCP agent (needs Ollama running)
+.venv/bin/python -m taskfence.agent --task "Summarize Q3 sales and post it to #sales." --mcp
+```
+
+The agent discovers tools **dynamically** over MCP (`tools/list`); the
+five tools are `read_file`, `search_drive`, `query_crm`, `send_slack` and
+`post_external`. `search_drive` returns metadata candidates only — search
+is not permission; each read is individually evaluated. Calls without a
+task context fail closed; APPROVE returns an approval_id with human
+instructions and never claims execution; an unreachable gateway returns a
+structured `gateway_unavailable` error instead of an invented decision.
+Details: `mcp_gateway/README.md`.
+
+### MCP scenarios and dashboard evidence
+
+```bash
+.venv/bin/python -m scenarios.mcp_runner    # writes reports/mcp_evidence.json
+```
+
+Runs MCP A (ALLOW → exactly one Slack sink line), MCP B (BLOCK → external
+sink byte-unchanged) and MCP C/C2 (BLOCK through lineage, keyword-free
+payload) over the real MCP stdio boundary against a real gateway, with an
+isolated state directory (repo outbox untouched). The Streamlit dashboard
+renders the stored evidence verbatim in an additive panel (origin
+"MCP agent") — no existing dashboard calculation changed.
+
+### MCP success criteria actually verified
+
+By the deterministic test suite (`tests/test_mcp_adapter.py`,
+`tests/test_agent_mcp.py`, `tests/test_mcp_scenarios.py`,
+`tests/test_mcp_real_integration.py`):
+
+- MCP server starts locally; exactly the five intended tools discover.
+- Protected MCP requests pass through the existing gateway; MCP code never
+  imports `taskfence.policy/lineage/tools/audit` (static AST + behavioral
+  tests) and no second policy/classification/lineage engine exists.
+- A = ALLOW (one sink line); B = BLOCK (sink byte-identical); C = BLOCK
+  through lineage with a zero-keyword payload.
+- APPROVE returns approval_id and does not execute; BLOCK is never retried.
+- MCP activity lands in the ONE existing `audit_events` trail.
+- Slack flag: ALLOW → exactly one HTTP POST; BLOCK/APPROVE → zero; human
+  `allow_once` → exactly one; URL never logged, committed or audited.
+
 > **Ollama integration has not been exercised in this environment.** All
 > green results come from the deterministic fallback and scripted flows.
 
@@ -193,6 +263,19 @@ the warning is the existing FastAPI/Starlette `TestClient` deprecation
 warning. No test was skipped, weakened, or rewritten to produce these
 numbers.
 
+After the MCP extension (adapter, `--mcp` agent, MCP scenarios, optional
+real Slack flag), the same deterministic command reports — exactly as
+observed:
+
+```text
+TASKFENCE_OLLAMA_URL=http://127.0.0.1:1 .venv/bin/pytest -q
+261 passed, 2 deselected in 46.56s
+```
+
+The two deselected tests are the optional live Ollama smoke test and the
+optional live Slack webhook delivery (`live_integration`), both excluded
+from the deterministic suite by `pytest.ini`.
+
 ## Stack
 
 Python · FastAPI · Pydantic v2 · SQLite (stdlib) · NetworkX · rule-based
@@ -226,12 +309,13 @@ This is a hackathon MVP; the following are known and intentional:
 ```text
 taskfence/   models · catalog · policy · explain · classifier · lineage
              audit · registry · tools · gateway · client · contract
-             agent · approvals
+             agent · approvals · mcp_client
+mcp_gateway/ MCP stdio adapter — five tools; adapter, not a security engine
 data/        fake drive / crm / hr / repo files (all fictional, .invalid domains)
 outbox/      slack_sales.jsonl · external_api.jsonl (fake sinks)
 dashboard/   Streamlit app (reads SQLite only)
-scenarios/   scenario_a..g + run_all.py
+scenarios/   scenario_a..g, mcp_scenario_a..c · run_all.py · mcp_runner.py
 tests/       one test file per source file + integration/e2e/no-bypass/claims
-reports/     results.md (generated by scenarios.run_all)
-specs/       project specification + DECISIONS.md (source of truth)
+reports/     results.md + mcp_evidence.json (generated)
+specs/       project specification + DECISIONS.md + MCP_DECISIONS.md
 ```

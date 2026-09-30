@@ -73,7 +73,29 @@ Open `reports/results.md`.
 
 ## If asked to go deeper
 
-- Tests: `.venv/bin/pytest -q` (170+ green; policy table-driven with
+- Tests: `.venv/bin/pytest -q` (260+ green; policy table-driven with
   hardcoded expectations; no-bypass tests: static AST + byte-identical sink).
 - Audit trail: every decision recorded append-only, including ALLOWs.
 - Full Q&A: `docs/JUDGE_QA.md`.
+
+## Optional MCP walkthrough (adds ~90s; scripted A/B/C fallback)
+
+Use the scripted MCP scenarios — no Ollama or live model required. If the
+MCP runner itself misbehaves, the main Beat 1–3 scripted scenarios remain
+the fallback and demo the same decisions without the MCP boundary.
+
+```bash
+python -m scenarios.mcp_runner    # real MCP stdio -> real gateway, isolated state
+```
+
+- **MCP A** (green): "Same legitimate flow as Beat 1, but the agent speaks
+  MCP — discovery first, then read ALLOW, send ALLOW, exactly one Slack
+  sink line. The MCP layer is an adapter: it decided nothing itself."
+- **MCP B** (red): "The injected exfiltration, now over MCP: the external
+  post is BLOCKed by the same policy engine, external sink byte-identical.
+  MCP changes the protocol, not the authority."
+- **MCP C** (red): "Average of salaries, keyword-free payload over MCP —
+  still BLOCKed through inherited lineage labels."
+- Close: "One audit trail, origin 'MCP agent': every MCP call evaluated by
+  the existing gateway. A different protocol reaches TaskFence; none
+  bypasses it."

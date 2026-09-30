@@ -65,3 +65,57 @@ vocabulary with a keyword fallback when the model is unavailable.
 — a controlled MVP test criterion, not a claim of universal security. The
 report prints that headline only when it is actually true, and lists false
 positives next to it.
+
+**Q: Why MCP?**
+MCP (Model Context Protocol) is becoming the standard way AI agents connect
+to tools and data sources. Supporting it means TaskFence can sit in front of
+tool flows for MCP-capable agents without changing the security model: the
+MCP layer (`mcp_gateway/`) is a pure adapter — five tools over stdio — that
+forwards every protected call through the same GatewayClient boundary into
+the same gateway pipeline. The adapter holds no policy logic (enforced by a
+static AST test), returns the gateway's real decision verbatim, and MCP
+activity lands in the one existing audit trail with an "MCP agent" origin.
+A different protocol reaches TaskFence; none bypasses it.
+
+**Q: Where is the security decision made?**
+Always in the TaskFence gateway — never in the model, never in the agent,
+never in the MCP adapter. Whether a request arrives from the scripted agent,
+the direct-Ollama loop, the MCP agent (`--mcp`) or any external MCP client,
+the identical pipeline runs: resolve → classify (incl. outbound rescan) →
+lineage taint → policy → audit → execute only on ALLOW. There is one Task
+Contract model, one classification, one lineage tracker, one approval store
+and one audit trail — the adapter creates no second security model. If no
+real gateway decision can be obtained, the adapter fails closed with a
+structured `gateway_unavailable` error; it never invents an outcome and
+nothing executes.
+
+**Q: What happens on APPROVE?**
+The operation is held, not executed. The MCP tool call returns immediately
+with the real decision, an approval_id and human instructions — it does not
+claim execution, does not wait, and does not retry. The agent-side client
+and the MCP adapter never hold the admin token; resolution stays human-only
+(dashboard or admin API: `allow_once` executes the exact stored request
+once under the reviewed contract binding, `expand_task` issues a new
+contract version, `deny` closes it). Until a human resolves, nothing was
+sent — including zero HTTP calls when the optional real Slack webhook is
+configured.
+
+**Q: Does MCP prevent every possible bypass?**
+No. MCP protects the flows that travel through the MCP adapter into
+TaskFence. It does not prevent unrestricted direct HTTP calls, shell
+commands, or other network egress that a process on the host could make
+outside the protected tool path — that is the territory of production
+sandbox/network enforcement (next question), which is deliberately out of
+scope here. What MCP adds is narrower and real: the standard agent protocol
+now has a purpose-bound gateway in front of it, with the same fail-closed,
+audited, contract-scoped enforcement as every other agent path.
+
+**Q: What would production sandbox/network enforcement add?**
+Enforcement below the tool boundary: OS-level sandboxing of the agent
+process, egress allowlists so only the gateway can reach approved
+destinations, and network-level controls that mirror the task policy —
+closing the direct-HTTP/shell paths the MVP explicitly does not cover.
+Those are system-level controls (containers, egress proxies, network
+policy), complementary to TaskFence rather than alternatives to it. The
+MVP claims only what it verifies: task-scoped runtime enforcement for
+tool-mediated data flows.
