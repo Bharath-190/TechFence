@@ -110,6 +110,19 @@ GatewayClient, and every decision is retrievable via `GET /audit`. The
 default `pytest -q` run stays fully green without Ollama (the test is
 deselected by default).
 
+### Optional: real Slack delivery (flag-gated)
+
+By default Slack messages are delivered only to the fake local sink
+(`outbox/slack_sales.jsonl`) — no HTTP call is made. Allowed flows can
+deliver to ONE real Slack incoming webhook when the environment variable
+`TASKFENCE_REAL_SLACK_WEBHOOK` is set in the **gateway** process (setup
+and guarantees: `mcp_gateway/README.md`). BLOCK and APPROVE send zero
+HTTP calls; ALLOW sends exactly one; the human-approved `allow_once`
+replay executes exactly once. The webhook URL is a secret: never
+hardcoded, committed or logged, and never written to audit payloads or
+sink records. Normal tests never touch the real network; the single live
+check is deselected by default (`pytest -m live_integration`).
+
 > **Ollama integration has not been exercised in this environment.** All
 > green results come from the deterministic fallback and scripted flows.
 

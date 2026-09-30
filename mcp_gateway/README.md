@@ -37,6 +37,41 @@ All tools accept `task_id` (existing TaskFence task) or `task_text` (a task
 is created via the existing gateway endpoint); neither → the call fails
 closed. Responses echo the gateway's decision verbatim.
 
+## Optional: real Slack delivery (flag-gated, M4)
+
+By default `send_slack` delivers only to the local fake sink
+(`outbox/slack_sales.jsonl`) — no HTTP call is made. To also deliver
+allowed messages to ONE real Slack incoming webhook, set the environment
+variable `TASKFENCE_REAL_SLACK_WEBHOOK` to the webhook URL **in the
+process that runs the TaskFence gateway** (the gateway executes the tool
+on ALLOW; the adapter process never needs the secret):
+
+```bash
+# create the webhook in Slack first (Slack admin UI → Incoming Webhooks),
+# then export it only in your shell — never commit it, never put it in
+# .env files or docs:
+export TASKFENCE_REAL_SLACK_WEBHOOK='https://hooks.slack.com/services/…'
+TASKFENCE_ADMIN_TOKEN=devtoken .venv/bin/uvicorn taskfence.gateway:app --port 8000
+```
+
+Behavior (unchanged decision logic — the same gateway/policy pipeline is
+the only security authority, there is no second Slack-specific check):
+
+- ALLOW → the fake sink line is written AND exactly one HTTP POST is sent
+  to the webhook; the tool result adds a `real_slack: delivered` note
+  (or `error_*` with a status/error name — never the URL) on failure.
+- BLOCK → zero HTTP calls (the tool never executes).
+- APPROVE → zero HTTP calls until a human resolves the approval; a human
+  `allow_once` executes exactly once → exactly one POST.
+- Webhook unset → everything behaves exactly as before (fake only).
+
+The URL is a secret: it is never logged, never returned in any result,
+and never written to the audit trail or the fake sink. Normal tests never
+contact the real network (the real-HTTP paths run against a local
+recorder); the one live test is `pytest -m live_integration` (deselected
+by default) and requires the variable to point at a real
+`hooks.slack.com` webhook.
+
 ## Quick MCP-client check
 
 ```bash

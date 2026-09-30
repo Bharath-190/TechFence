@@ -11,11 +11,51 @@ plus raw **args in the agent-supplied shape:
     "content": str,              # content the gateway decided may move
   }
 Sinks receive exactly one JSONL line per executed call.
+
+M4 (optional real Slack): send_slack additionally performs exactly ONE real
+HTTP POST to the single Slack incoming webhook from
+TASKFENCE_REAL_SLACK_WEBHOOK — but ONLY on the gateway-executed ALLOW path
+(this function body runs only after an ALLOW decision). BLOCK and APPROVE
+never reach it, so they perform zero HTTP calls. Fake behavior (the JSONL
+sink) is unchanged and stays the default when the variable is unset. The
+webhook URL is a secret: never logged, never returned, never audited.
 """
 
 import json
+import os
+
+import httpx
 
 from taskfence import registry
+
+REAL_SLACK_WEBHOOK_ENV = "TASKFENCE_REAL_SLACK_WEBHOOK"
+# Fail-closed POST timeout: a real delivery attempt must not hang the
+# gateway response, and any HTTP failure is reported in the tool result
+# WITHOUT the webhook URL (detail carries status/error text only).
+REAL_SLACK_TIMEOUT_SECONDS = 5.0
+
+
+def real_slack_webhook() -> str:
+    """The configured real webhook URL, or '' when real Slack is disabled
+    (fake sinks remain the default, kit M4 requirement 1/2)."""
+    return os.environ.get(REAL_SLACK_WEBHOOK_ENV, "").strip()
+
+
+def _post_real_slack(text: str) -> dict:
+    """Exactly one real Slack incoming-webhook POST (kit M4 req. 7). Uses
+    the existing httpx dependency only (req. 4). Returns a secret-free
+    delivery note; the URL itself is never echoed, logged or audited
+    (req. 10/11). Never raises: gateway execution already succeeded."""
+    webhook = real_slack_webhook()
+    if not webhook:
+        return {}
+    try:
+        response = httpx.post(webhook, json={"text": text},
+                              timeout=REAL_SLACK_TIMEOUT_SECONDS)
+        return {"real_slack": "delivered" if response.status_code == 200
+                else f"error_status_{response.status_code}"}
+    except httpx.HTTPError as error:
+        return {"real_slack": f"error_{type(error).__name__}"}
 
 # tool name -> metadata (gateway resolves actions/destinations from this).
 TOOL_REGISTRY = {
@@ -73,7 +113,11 @@ def send_slack(ctx: dict, **args) -> dict:
     _append_line("slack_sales", {
         "channel": channel, "text": text, "task_id": ctx.get("task_id", ""),
         "asset_id": ctx.get("source_asset") or ""})
-    return {"delivered": True, "channel": channel, "sink": "slack_sales"}
+    # M4: exactly one real-webhook POST on this ALLOW-executed path; no
+    # webhook configured -> zero HTTP calls (fake default, req. 1/2).
+    result = {"delivered": True, "channel": channel, "sink": "slack_sales"}
+    result.update(_post_real_slack(text))
+    return result
 
 
 def post_external(ctx: dict, **args) -> dict:
