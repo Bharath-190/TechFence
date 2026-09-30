@@ -343,6 +343,42 @@ def metrics_panel() -> None:
                "criterion, not a claim of universal security.")
 
 
+# Kit P4-M3: additive MCP evidence panel. Reads the MCP scenario runs'
+# stored evidence (reports/mcp_evidence.json, produced by
+# `python -m scenarios.mcp_runner`) and renders it verbatim — the
+# dashboard computes nothing about security. Existing panels untouched.
+MCP_EVIDENCE = "reports/mcp_evidence.json"
+
+
+def _mcp_evidence_rows() -> list[dict] | None:
+    path = Path(os.environ.get("TASKFENCE_MCP_EVIDENCE_PATH", MCP_EVIDENCE))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def mcp_evidence_panel() -> None:
+    rows = _mcp_evidence_rows()
+    st.subheader("MCP RUN EVIDENCE")
+    if not rows:
+        st.info("No MCP run evidence yet — run "
+                "`python -m scenarios.mcp_runner`.")
+        return
+    st.dataframe(
+        [{key: row.get(key, "") for key in
+          ("run", "phase", "tool", "decision", "origin")} for row in rows],
+        width='stretch', height=200)
+    outcomes = [row.get("decision", "") for row in rows]
+    st.caption(
+        f"{len(rows)} audited MCP call(s) — ALLOW: {outcomes.count('ALLOW')}"
+        f", BLOCK: {outcomes.count('BLOCK')}, APPROVE: "
+        f"{outcomes.count('APPROVE')} — read from stored audit evidence "
+        "(origin: MCP agent). Every MCP tool call was evaluated by the "
+        "existing gateway pipeline; the MCP layer is an adapter, not a "
+        "second policy engine.")
+
+
 def _flow_dot(state: dict) -> str:
     decision = (state.get("last_decision") or {})
     outcome = (decision.get("decision") or {}).get("outcome", "BLOCK")
@@ -680,3 +716,7 @@ if events:
     st.dataframe(events, width='stretch', height=240)
 else:
     st.caption("No audit events recorded yet.")
+
+# Kit P4-M3 (additive): MCP run evidence renders AFTER the audit trail so
+# existing element ordering (and positional test indexes) stay unchanged.
+mcp_evidence_panel()
