@@ -8,6 +8,8 @@ jobs:
   deterministic:
     name: Deterministic tier (SQLite)
     runs-on: ubuntu-latest
+    env:
+      TASKFENCE_OLLAMA_URL: http://127.0.0.1:1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
