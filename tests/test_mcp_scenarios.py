@@ -57,6 +57,13 @@ def _evidence_fixture(tmp_path, monkeypatch) -> Path:
 # --- 1. real-boundary behavior -----------------------------------------------
 
 
+def test_mcp_runner_uses_current_interpreter_without_repo_venv(tmp_path):
+    """Subprocess interpreter selection must not depend on a repo-local venv."""
+    runner = MCPRunner(repo_root=tmp_path)
+    assert runner.python == sys.executable
+    assert not (tmp_path / ".venv" / "bin" / "python").exists()
+
+
 def test_mcp_scenario_a_allows_and_delivers_exactly_once():
     result, audit = mcp_scenario_a.collect()
     assert result.passed, (result.decisions, result.details)
@@ -125,7 +132,7 @@ def test_mcp_fail_closed_without_inventing_a_decision():
 
     async def _call_dead_gateway() -> dict:
         params = StdioServerParameters(
-            command=str(repo_root / ".venv" / "bin" / "python"),
+            command=sys.executable,
             args=["-m", "mcp_gateway.server"],
             env=_mcp_env("http://127.0.0.1:9", repo_root))
         async with stdio_client(params) as (read, write):

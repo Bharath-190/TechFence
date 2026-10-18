@@ -119,8 +119,9 @@ def test_migration_is_idempotent_and_preserves_existing_rows(pg_url):
     reserved_values = again.db.query(
         "SELECT tenant_id, subject, trace_id, idempotency_key"
         " FROM audit_events WHERE task_id = %s", (task_id,))
-    assert all(value is None for row in reserved_values
-               for value in row.values())
+    assert reserved_values == [{
+        "tenant_id": None, "subject": None, "trace_id": None,
+        "idempotency_key": None}]
 
 
 def test_duplicate_keys_are_rejected_but_reads_are_idempotent(pg_persistence):

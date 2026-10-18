@@ -27,6 +27,12 @@ def test_append_then_read(tmp_path):
     row_id = log.log_event(SAMPLE_EVENT)
     rows = log.read_all()
     assert len(rows) == 1 and rows[0]["id"] == row_id
+    assert rows[0]["subject"] is None  # reserved identity field stays NULL
+
+    supplied_id = log.log_event(dict(SAMPLE_EVENT, subject="auth0|explicit"))
+    supplied = next(row for row in log.read_all()
+                    if row["id"] == supplied_id)
+    assert supplied["subject"] == "auth0|explicit"  # explicit identity retained
     assert rows[0]["decision"] == "BLOCK"
     assert "CUSTOMER_DATA" in rows[0]["labels"]
     assert "customer_db" in rows[0]["sources"]

@@ -28,6 +28,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -94,7 +95,7 @@ def _mcp(base_url: str, tool: str, args: dict, repo_root: Path) -> dict:
 
     async def _run() -> dict:
         params = StdioServerParameters(
-            command=str(repo_root / ".venv" / "bin" / "python"),
+            command=sys.executable,
             args=["-m", "mcp_gateway.server"], env=_mcp_env(base_url,
                                                             repo_root))
         async with stdio_client(params) as (read, write):
@@ -113,7 +114,7 @@ def _list_tools(base_url: str, repo_root: Path) -> set[str]:
 
     async def _run() -> set[str]:
         params = StdioServerParameters(
-            command=str(repo_root / ".venv" / "bin" / "python"),
+            command=sys.executable,
             args=["-m", "mcp_gateway.server"], env=_mcp_env(base_url,
                                                             repo_root))
         async with stdio_client(params) as (read, write):
@@ -183,7 +184,7 @@ class MCPRunner:
     def __init__(self, repo_root: Path | None = None):
         self.repo_root = (Path(repo_root) if repo_root
                           else Path(__file__).resolve().parents[1])
-        self.python = str(self.repo_root / ".venv" / "bin" / "python")
+        self.python = sys.executable
         self.workdir = Path(tempfile.mkdtemp(prefix="tf_mcp_scenarios_"))
         self._owns_dir = True
         self._old_cwd: Path | None = None

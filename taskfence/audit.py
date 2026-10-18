@@ -51,7 +51,7 @@ class AuditLog:
                  event["destination"], event["decision"],
                  " || ".join(event.get("reasons", [])),
                  event.get("lineage_path", ""),
-                 event.get("subject", "")))
+                 event.get("subject")))
             row = conn.execute(
                 "SELECT lastval()" if self.db.backend == "postgres"
                 else "SELECT last_insert_rowid()").fetchone()
