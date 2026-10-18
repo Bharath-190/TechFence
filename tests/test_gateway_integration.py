@@ -11,15 +11,10 @@ from taskfence.gateway import app
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    # Isolate state WITHOUT chdir: data/ paths are CWD-relative.
-    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
-    import taskfence.gateway as gw
-    from taskfence.audit import AuditLog
-    from taskfence.lineage import LineageTracker
-    monkeypatch.setattr(gw, "TRACKER",
-                        LineageTracker(db_path=tmp_path / "lin.db"))
-    monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
+def client(isolate_gateway):
+    # Isolate state WITHOUT chdir: data/ paths are CWD-relative. Every store,
+    # including TASKS, shares one temporary database (AD-21/AD-25), so no
+    # test writes to the repository's default SQLite file.
     registry.reset_outbox()
     with TestClient(app) as test_client:
         yield test_client

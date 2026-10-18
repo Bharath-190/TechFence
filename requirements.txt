@@ -9,3 +9,13 @@ pytest
 mcp==2.2.0
 # ollama runs as an external local service; the optional real-model tests
 # use plain httpx against localhost:11434, so no extra client package needed.
+
+# Phase 2: PostgreSQL client (explicit SQL, no ORM)
+psycopg[binary]
+
+# Phase 3 (G-04): JWT verification (single PEM public key, fixed alg list).
+# The [crypto] extra is REQUIRED: taskfence/auth.py imports
+# cryptography.hazmat... directly and PyJWT only declares cryptography under
+# that extra, so plain `PyJWT` leaves a clean install unable to import the
+# gateway at all.
+PyJWT[crypto]

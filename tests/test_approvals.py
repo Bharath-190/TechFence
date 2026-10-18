@@ -11,21 +11,10 @@ ADMIN = {"X-Admin-Token": "devtoken"}
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(isolate_gateway, monkeypatch):
+    # One temporary database for EVERY store (AD-21/AD-25): TASKS included,
+    # so no test touches the repository's default SQLite file.
     monkeypatch.setenv("TASKFENCE_ADMIN_TOKEN", "devtoken")
-    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
-    import taskfence.gateway as gw
-    from taskfence.audit import AuditLog
-    from taskfence.lineage import LineageTracker
-    from taskfence.approvals import ApprovalStore
-    monkeypatch.setattr(gw, "TRACKER",
-                        LineageTracker(db_path=tmp_path / "lin.db"))
-    monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
-    monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(tmp_path / "appr.db"))
-    from taskfence.audit import TaskStateStore
-    monkeypatch.setattr(gw, "STATE", TaskStateStore(tmp_path / "state.db"))
-    monkeypatch.setattr("taskfence.contract._ollama_chat",
-                        lambda task_text: None)
     registry.reset_outbox()
     with TestClient(app) as test_client:
         yield test_client
@@ -114,7 +103,7 @@ def test_expand_task_creates_new_version_old_unchanged(client):
     assert contract["version"] != before["version"]
     # Old contract object unchanged in state:
     import taskfence.gateway as gw
-    assert gw.CONTRACTS[task_id].version == contract["version"]
+    assert gw.TASKS.get_contract(task_id).version == contract["version"]
     # A follow-up with the expanded data no longer violates the source
     # scope; the restricted label still requires human review (kit A-T:
     # a restricted label never yields ALLOW), so it APPROVEs with only
@@ -144,6 +133,35 @@ def test_openapi_has_no_contract_edit_endpoint(client):
     assert contractish == [] or all(
         not any(m.lower() in forbidden for m in
                 schema["paths"][p]) for p in contractish)
+
+
+def test_resolution_cannot_bypass_the_pending_state_claim(client):
+    """F4: the store exposes no unconditional status setter, and every
+    claim is conditional on the record still being pending."""
+    import taskfence.gateway as gw
+    from taskfence.approvals import ApprovalStore
+
+    assert not hasattr(ApprovalStore, "set_status")
+
+    _, approval_id = _setup_task(client)
+    store = gw.APPROVALS
+    # An unknown target state is rejected before any write:
+    with pytest.raises(ValueError):
+        store.claim(approval_id, "pending")
+    with pytest.raises(ValueError):
+        store.claim(approval_id, "resolved")
+    assert store.get(approval_id)["status"] == "pending"
+
+    # The conditional claim is the only transition: first caller wins,
+    # every later claim loses no matter which outcome it asks for.
+    assert store.claim(approval_id, "allowed_once") is True
+    assert store.claim(approval_id, "denied") is False
+    assert store.claim(approval_id, "expanded") is False
+    assert store.get(approval_id)["status"] == "allowed_once"
+    # The gateway honours the consumed record too:
+    assert client.post(f"/approvals/{approval_id}/resolve",
+                       json={"choice": "deny"},
+                       headers=ADMIN).status_code == 409
 
 
 def test_unknown_approval_404(client):

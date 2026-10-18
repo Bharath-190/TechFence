@@ -106,6 +106,139 @@ def test_dashboard_decision_filter(seeded_db):
     assert "ALLOW" not in table_text
 
 
+def _demo_counts(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return tuple(conn.execute(
+            f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("audit_events", "task_state", "approvals"))
+    finally:
+        conn.close()
+
+
+def test_pending_approval_card_shows_timestamp_and_age(seeded_db):
+    """R2: the human sees when a request was created and how long it has
+    been pending. Informational only — nothing expires."""
+    from datetime import datetime, timedelta, timezone
+    from streamlit.testing.v1 import AppTest
+
+    created_at = (datetime.now(timezone.utc)
+                  - timedelta(days=5, hours=1)).isoformat(timespec="seconds")
+    conn = sqlite3.connect(seeded_db)
+    conn.execute(
+        "INSERT INTO approvals (approval_id, task_id, tool, args, reasons,"
+        " status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("apr-age", "t1", "send_slack", "{}", "needs review", "pending",
+         created_at, None))
+    conn.commit()
+    conn.close()
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    assert not at.exception, at.exception
+    rendered = "\n".join(md.value or "" for md in at.markdown)
+    assert "Pending since" in rendered
+    assert created_at in rendered
+    assert "5 days ago" in rendered
+
+
+def test_demo_reset_requires_explicit_confirmation(seeded_db):
+    """F3: the destructive reset is an operator action. Clicking it without
+    the confirmation checkbox deletes nothing and says so; the checkbox
+    label names everything that would be removed."""
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    assert not at.exception, at.exception
+
+    reset_buttons = [b for b in at.button if "Reset" in b.label]
+    assert len(reset_buttons) == 1, [b.label for b in at.button]
+    confirmations = [c for c in at.checkbox
+                     if "permanently deletes" in c.label]
+    assert len(confirmations) == 1
+    assert "decisions" in confirmations[0].label  # effect is stated plainly
+    assert confirmations[0].value is False         # opt-in, never preselected
+
+    before = _demo_counts(seeded_db)
+    reset_buttons[0].click().run()
+    assert not at.exception, at.exception
+    assert _demo_counts(seeded_db) == before  # nothing deleted
+    assert any("NOT performed" in w.value for w in at.warning)
+
+
+def test_confirmed_demo_reset_clears_only_demo_rows(seeded_db, tmp_path,
+                                                   monkeypatch):
+    """The confirmed branch still works: with the box ticked, the demo
+    rows are cleared. Runs in a temporary CWD so the repository's tracked
+    outbox sinks are never touched."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.chdir(tmp_path)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    at.checkbox[0].check().run()
+    reset = [b for b in at.button if "Reset" in b.label]
+    assert len(reset) == 1
+    reset[0].click().run()
+    assert not at.exception, at.exception
+    assert _demo_counts(seeded_db) == (0, 0, 0)
+    # The repository's own outbox sinks are untouched:
+    assert not (tmp_path / "outbox").exists()
+
+
+def _enable_jwt_mode(monkeypatch) -> None:
+    """Point the dashboard process at a valid JWT configuration."""
+    from tests.jwt_keys import TEST_PUBLIC_KEY
+
+    monkeypatch.setenv("TASKFENCE_AUTH_MODE", "jwt")
+    monkeypatch.setenv("TASKFENCE_JWT_PUBLIC_KEY", TEST_PUBLIC_KEY)
+    monkeypatch.setenv("TASKFENCE_JWT_ISSUER", "https://issuer.test/")
+    monkeypatch.setenv("TASKFENCE_JWT_AUDIENCE", "taskfence-api")
+
+
+def test_jwt_mode_without_a_reviewer_token_is_called_out(seeded_db,
+                                                        monkeypatch):
+    """Phase 3 (G-04): the dashboard must not leave the operator guessing
+    why approval calls fail. JWT mode without a reviewer token gets an
+    explicit message naming the variable to set."""
+    from streamlit.testing.v1 import AppTest
+
+    _enable_jwt_mode(monkeypatch)
+    monkeypatch.delenv("TASKFENCE_REVIEWER_JWT", raising=False)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    assert not at.exception, at.exception
+    errors = " ".join(error.value or "" for error in at.error)
+    assert "TASKFENCE_REVIEWER_JWT" in errors
+
+
+def test_jwt_mode_with_a_reviewer_token_does_not_warn(seeded_db, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    _enable_jwt_mode(monkeypatch)
+    monkeypatch.setenv("TASKFENCE_REVIEWER_JWT", "test-access-token")
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    assert not at.exception, at.exception
+    errors = " ".join(error.value or "" for error in at.error)
+    assert "TASKFENCE_REVIEWER_JWT" not in errors
+
+
+def test_local_mode_does_not_mention_a_reviewer_token(seeded_db, monkeypatch):
+    """The JWT guidance appears only when JWT mode is actually configured."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.delenv("TASKFENCE_AUTH_MODE", raising=False)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    assert not at.exception, at.exception
+    errors = " ".join(error.value or "" for error in at.error)
+    assert "TASKFENCE_REVIEWER_JWT" not in errors
+
+
 def test_dashboard_empty_db_is_graceful(tmp_path, monkeypatch):
     monkeypatch.setenv("TASKFENCE_DB", str(tmp_path / "missing.sqlite3"))
     from streamlit.testing.v1 import AppTest

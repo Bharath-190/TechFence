@@ -36,7 +36,7 @@ from test_dashboard_scenario_d import real_gateway  # noqa: E402,F401
 from taskfence import registry, tools  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVER_CMD = str(REPO_ROOT / ".venv" / "bin" / "python")
+SERVER_CMD = sys.executable
 TASK_TEXT = "Summarize Q3 sales and post it to #sales."
 ALLOW_ARGS = {"channel": "#sales",
               "text": "Q3: steady growth across all regions.",

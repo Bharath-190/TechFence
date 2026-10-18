@@ -14,10 +14,10 @@ All FIX1 fail-closed checks run BEFORE the approval is claimed or anything
 executes. expand_task still belongs to the live session and fails closed
 when the task is not active in this gateway process.
 
-These tests simulate a gateway restart by deleting the task's in-memory
-state (CONTRACTS/TASK_TEXT/LAST_DECISION) while keeping the SQLite-backed
-stores — exactly what a real restart does to process memory while
-preserving the database.
+Phase 2 moved authoritative task, contract and decision state into the
+database, so these tests simulate a gateway restart by rebuilding every
+store from the same on-disk database (fresh `Database` objects, no shared
+process memory) — exactly what a restarted process sees.
 """
 
 import json
@@ -37,26 +37,34 @@ DISTINCTIVE_PAYLOAD = (
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    """Real gateway app with every store bound to tmp_path SQLite files
-    and the outbox isolated — the same layout a restarted gateway would
-    re-open from disk."""
+def client(isolate_gateway, monkeypatch):
+    """Real gateway app bound to ONE temp database plus a `restart()`
+    helper that rebuilds every store from that same database — what a
+    real restart of the process leaves in place."""
     monkeypatch.setenv("TASKFENCE_ADMIN_TOKEN", "devtoken")
-    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
     import taskfence.gateway as gw
-    from taskfence.audit import AuditLog, TaskStateStore
     from taskfence.approvals import ApprovalStore
+    from taskfence.audit import AuditLog, TaskStateStore
+    from taskfence.config import Config
     from taskfence.lineage import LineageTracker
-    monkeypatch.setattr(gw, "TRACKER",
-                        LineageTracker(db_path=tmp_path / "lin.db"))
-    monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
-    monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(tmp_path / "appr.db"))
-    monkeypatch.setattr(gw, "STATE", TaskStateStore(tmp_path / "state.db"))
-    monkeypatch.setattr("taskfence.contract._ollama_chat",
-                        lambda task_text: None)
+    from taskfence.persistence import Database, TaskStore
+
+    def restart():
+        db = Database(Config.from_env(
+            {"TASKFENCE_DB": str(isolate_gateway.sqlite_path)}))
+        monkeypatch.setattr(gw, "TASKS", TaskStore(db))
+        monkeypatch.setattr(gw, "TRACKER", LineageTracker(db))
+        monkeypatch.setattr(gw, "AUDIT", AuditLog(db))
+        monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(db))
+        monkeypatch.setattr(gw, "STATE", TaskStateStore(db))
+        # F2: a restart also loses process-local review sessions. Durable
+        # state survives; expansion liveness does not.
+        monkeypatch.setattr(gw, "LIVE_TASKS", gw.LIVE_TASKS.__class__())
+        return db
+
     registry.reset_outbox()
     with TestClient(app) as test_client:
-        yield test_client, gw
+        yield test_client, gw, restart
     registry.reset_outbox()
 
 
@@ -73,14 +81,6 @@ def _approve(client, text=DISTINCTIVE_PAYLOAD, channel="#hr-ops"):
     return task_id, response["approval_id"], args
 
 
-def _simulate_restart(gw, task_id):
-    """Recreate what a gateway restart does to PROCESS memory (SQLite
-    stores on disk are untouched): in-memory maps lose the task."""
-    gw.CONTRACTS.pop(task_id, None)
-    gw.TASK_TEXT.pop(task_id, None)
-    gw.LAST_DECISION.pop(task_id, None)
-
-
 def _resolve(client, approval_id, choice="allow_once"):
     return client.post(f"/approvals/{approval_id}/resolve",
                        json={"choice": choice}, headers=ADMIN)
@@ -94,13 +94,15 @@ def _sink_lines():
 
 
 def test_persisted_approval_resolves_after_restart(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, args = _approve(client)
     assert approval_id in {row["approval_id"]
                            for row in gw.APPROVALS.pending()}
 
-    _simulate_restart(gw, task_id)
-    assert task_id not in gw.CONTRACTS      # the exact 404 trigger, removed
+    restart()
+    # Durable authority: the restarted process still resolves the task
+    # from the database (no in-memory map involved).
+    assert gw.TASKS.get_contract(task_id) is not None
     assert gw.APPROVALS.get(approval_id)["status"] == "pending"
 
     response = _resolve(client, approval_id)
@@ -134,9 +136,9 @@ def test_persisted_approval_resolves_after_restart(client):
 def test_denied_persisted_approval_resolves_after_restart(client):
     """Deny must work for persisted approvals too — the human can always
     reject, restart or not (executes nothing)."""
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
+    restart()
     response = _resolve(client, approval_id, choice="deny")
     assert response.status_code == 200
     body = response.json()
@@ -152,13 +154,12 @@ def test_denied_persisted_approval_resolves_after_restart(client):
 
 
 def test_missing_contract_binding_fails_closed_after_restart(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
-    gw.APPROVALS.conn.execute(
+    restart()
+    gw.APPROVALS.db.execute(
         "UPDATE approvals SET args = ? WHERE approval_id = ?",
         (json.dumps({"request": {}}), approval_id))
-    gw.APPROVALS.conn.commit()
 
     response = _resolve(client, approval_id)
     assert response.status_code == 409
@@ -173,16 +174,15 @@ def test_missing_contract_binding_fails_closed_after_restart(client):
 
 
 def test_corrupted_contract_snapshot_fails_closed_after_restart(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
+    restart()
     record = gw.APPROVALS.get(approval_id)
     record["contract_snapshot"]["purpose"] = "hr_analytics"  # tampered
     record["contract_id"] = "c-forged"
-    gw.APPROVALS.conn.execute(
+    gw.APPROVALS.db.execute(
         "UPDATE approvals SET args = ? WHERE approval_id = ?",
         (json.dumps(record), approval_id))
-    gw.APPROVALS.conn.commit()
 
     response = _resolve(client, approval_id)
     assert response.status_code == 409
@@ -191,15 +191,14 @@ def test_corrupted_contract_snapshot_fails_closed_after_restart(client):
 
 
 def test_missing_exact_tool_args_fails_closed_after_restart(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
+    restart()
     record = gw.APPROVALS.get(approval_id)
     record["tool_args"] = None   # FIX1: no exact args -> no execution
-    gw.APPROVALS.conn.execute(
+    gw.APPROVALS.db.execute(
         "UPDATE approvals SET args = ? WHERE approval_id = ?",
         (json.dumps(record), approval_id))
-    gw.APPROVALS.conn.commit()
 
     response = _resolve(client, approval_id)
     assert response.status_code == 409
@@ -212,9 +211,9 @@ def test_missing_exact_tool_args_fails_closed_after_restart(client):
 
 
 def test_second_resolution_is_rejected_409(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
+    restart()
     first = _resolve(client, approval_id)
     assert first.status_code == 200
     assert len(_sink_lines()) == 1
@@ -227,11 +226,11 @@ def test_second_resolution_is_rejected_409(client):
 
 def test_resolved_before_restart_stays_resolved_after(client):
     """A restart must not resurrect an already-consumed approval."""
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
     assert _resolve(client, approval_id).status_code == 200
     delivered = _sink_lines()[0]["text"]
-    _simulate_restart(gw, task_id)
+    restart()
     again = _resolve(client, approval_id)
     assert again.status_code == 409
     assert [row["text"] for row in _sink_lines()] == [delivered]
@@ -241,9 +240,9 @@ def test_resolved_before_restart_stays_resolved_after(client):
 
 
 def test_exact_payload_preserved_across_restart(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, args = _approve(client)
-    _simulate_restart(gw, task_id)
+    restart()
     resolved = _resolve(client, approval_id)
     assert resolved.status_code == 200
     # The tool result confirms the executed channel; the EXACT payload is
@@ -264,37 +263,90 @@ def test_exact_payload_preserved_across_restart(client):
 
 
 def test_expand_task_after_restart_fails_closed_pending(client):
-    """expand_task installs a NEW live contract version — it requires the
-    task's live session, so after a restart it fails closed (409) and the
-    record stays pending; deny/allow_once remain available."""
-    client, gw = client
+    """F2 (blocking): `expand_task` issues a NEW contract version for a live
+    review session. After a restart there is no live session, so the pending
+    record is preserved, nothing expands and nothing dispatches — deny /
+    allow_once remain available. A stale expansion approval can never widen
+    scope indefinitely."""
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
+    version_before = gw.TASKS.get_contract(task_id).version
+    restart()
+    # The task itself is durable and visible to the restarted process:
+    assert gw.TASKS.get_contract(task_id) is not None
+    assert gw.TASKS.get_contract(task_id).version == version_before
+
+    response = _resolve(client, approval_id, choice="expand_task")
+    assert response.status_code == 409
+    assert "live review session" in response.json()["detail"]
+    # Not consumed, not expanded, not dispatched:
+    assert gw.APPROVALS.get(approval_id)["status"] == "pending"
+    assert gw.TASKS.get_contract(task_id).version == version_before
+    assert _sink_lines() == []
+    # Repeated attempts stay fail-closed and still do not consume it:
+    assert _resolve(client, approval_id,
+                    choice="expand_task").status_code == 409
+    assert gw.APPROVALS.get(approval_id)["status"] == "pending"
+    assert _sink_lines() == []
+    # The human can still resolve it safely, exactly once (replay is a 409):
+    assert _resolve(client, approval_id).status_code == 200
+    assert len(_sink_lines()) == 1
+    assert _resolve(client, approval_id, choice="expand_task").status_code == 409
+    assert len(_sink_lines()) == 1
+
+
+def test_expand_task_with_stale_version_binding_fails_closed(client):
+    """A live session is not sufficient: the record must still match the
+    contract version the human reviewed (FIX1-E + F2)."""
+    client, gw, restart = client
+    task_id, approval_id, _ = _approve(client)
+    record = gw.APPROVALS.get(approval_id)
+    data = json.loads(record["args"])
+    data["contract_version"] = "0" * 64          # stale reviewed version
+    gw.APPROVALS.db.execute(
+        "UPDATE approvals SET args = ? WHERE approval_id = ?",
+        (json.dumps(data), approval_id))
+    version_before = gw.TASKS.get_contract(task_id).version
+
     response = _resolve(client, approval_id, choice="expand_task")
     assert response.status_code == 409
     assert gw.APPROVALS.get(approval_id)["status"] == "pending"
-    # The same approval still resolves by allow_once (or deny):
+    assert gw.TASKS.get_contract(task_id).version == version_before
+    assert _sink_lines() == []
+
+
+def test_expand_task_fails_closed_when_task_is_gone(client):
+    """When the durable task row is absent there is no reviewed live
+    contract to expand: 409, fail closed, approval stays pending."""
+    client, gw, restart = client
+    task_id, approval_id, _ = _approve(client)
+    restart()
+    gw.TASKS.db.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+    response = _resolve(client, approval_id, choice="expand_task")
+    assert response.status_code == 409
+    assert gw.APPROVALS.get(approval_id)["status"] == "pending"
+    # The same approval still resolves by allow_once (nothing was consumed):
     assert _resolve(client, approval_id).status_code == 200
 
 
 def test_expand_task_works_while_task_is_live(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
     response = _resolve(client, approval_id, choice="expand_task")
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "expanded"
     assert body["contract"]["parent_contract_id"]
-    assert gw.CONTRACTS[task_id].parent_contract_id
+    assert gw.TASKS.get_contract(task_id).parent_contract_id
 
 
 # --- admin gate + sink discipline -------------------------------------------
 
 
 def test_resolution_requires_admin_token_after_restart(client):
-    client, gw = client
+    client, gw, restart = client
     task_id, approval_id, _ = _approve(client)
-    _simulate_restart(gw, task_id)
+    restart()
     no_token = client.post(f"/approvals/{approval_id}/resolve",
                            json={"choice": "allow_once"})
     assert no_token.status_code == 403

@@ -84,21 +84,28 @@ class Harness:
         self.db_dir.mkdir(parents=True, exist_ok=True)
         self._saved = {
             "gw": {name: getattr(gw, name) for name in
-                   ("TRACKER", "AUDIT", "APPROVALS", "STATE", "CONTRACTS",
-                    "TASK_TEXT", "LAST_DECISION")},
+                   ("DB", "TASKS", "TRACKER", "AUDIT", "APPROVALS",
+                    "STATE", "LIVE_TASKS")},
             "registry_outbox": registry.OUTBOX_DIR,
             "httpx_client": client_mod.httpx.Client,
             "env_token": os.environ.get("TASKFENCE_ADMIN_TOKEN"),
         }
-        from taskfence.approvals import ApprovalStore
-        from taskfence.audit import AuditLog, TaskStateStore
-        from taskfence.lineage import LineageTracker
+        from taskfence.config import Config
+        from taskfence.persistence import Persistence
 
-        gw.TRACKER = LineageTracker(db_path=self.db_dir / "lin.db")
-        gw.AUDIT = AuditLog(self.db_dir / "audit.db")
-        gw.APPROVALS = ApprovalStore(self.db_dir / "appr.db")
-        gw.STATE = TaskStateStore(self.db_dir / "state.db")
-        gw.CONTRACTS, gw.TASK_TEXT, gw.LAST_DECISION = {}, {}, {}
+        # One isolated SQLite backend for this scenario run, regardless of
+        # any PostgreSQL URL in the surrounding process environment.
+        persistence = Persistence(Config.from_env({
+            "TASKFENCE_DB": str(self.db_dir / "taskfence.sqlite3")}))
+        gw.DB = persistence.db
+        gw.TASKS = persistence.tasks
+        gw.TRACKER = persistence.lineage
+        gw.AUDIT = persistence.audit
+        gw.APPROVALS = persistence.approvals
+        gw.STATE = persistence.state
+        # F2: a scenario run has its own live review sessions, and the
+        # caller's liveness set is restored on exit.
+        gw.LIVE_TASKS = gw.LIVE_TASKS.__class__()
         registry.OUTBOX_DIR = self.db_dir / "outbox"
         registry.reset_outbox()
         os.environ["TASKFENCE_ADMIN_TOKEN"] = ADMIN_TOKEN

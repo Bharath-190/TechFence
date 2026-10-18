@@ -9,7 +9,6 @@ import pytest
 
 from taskfence import registry
 from taskfence.agent import MAX_STEPS, OllamaAgent, ScriptedAgent
-from taskfence.gateway import CONTRACTS
 
 
 class _SpyChat:

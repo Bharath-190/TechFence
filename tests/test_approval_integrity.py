@@ -12,7 +12,6 @@ No session-taint policy is changed here (FIX-D5 is a separate phase).
 """
 
 import json
-import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,20 +32,8 @@ LONG_PAYLOAD = (
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(isolate_gateway, monkeypatch):
     monkeypatch.setenv("TASKFENCE_ADMIN_TOKEN", "devtoken")
-    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
-    import taskfence.gateway as gw
-    from taskfence.audit import AuditLog, TaskStateStore
-    from taskfence.approvals import ApprovalStore
-    from taskfence.lineage import LineageTracker
-    monkeypatch.setattr(gw, "TRACKER",
-                        LineageTracker(db_path=tmp_path / "lin.db"))
-    monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
-    monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(tmp_path / "appr.db"))
-    monkeypatch.setattr(gw, "STATE", TaskStateStore(tmp_path / "state.db"))
-    monkeypatch.setattr("taskfence.contract._ollama_chat",
-                        lambda task_text: None)
     registry.reset_outbox()
     with TestClient(app) as test_client:
         yield test_client
@@ -74,13 +61,14 @@ def _mutate_current_contract(client, task_id):
     version with a different id, without touching stored approvals."""
     import taskfence.gateway as gw
     import copy
-    current = gw.CONTRACTS[task_id]
+    current = gw.TASKS.get_contract(task_id)
     forged = copy.deepcopy(current.model_dump())
     forged["contract_id"] = current.contract_id + "-forged"
     forged["created_at"] = "2099-01-01T00:00:00+00:00"
     from taskfence.models import TaskContract
-    gw.CONTRACTS[task_id] = TaskContract.model_validate(forged)
-    return gw.CONTRACTS[task_id]
+    replacement = TaskContract.model_validate(forged)
+    gw.TASKS.set_contract(task_id, replacement)
+    return gw.TASKS.get_contract(task_id)
 
 
 # --- 1. Exact allow_once fidelity -------------------------------------------
@@ -153,12 +141,9 @@ def test_stale_binding_fails_closed_without_executing(client, tmp_path):
     record = gw.APPROVALS.get(approval_id)
     data = json.loads(record["args"])  # raw stored args JSON
     data["contract_version"] = "0" * 64  # stale version
-    conn = sqlite3.connect(tmp_path / "appr.db")
-    with conn:
-        conn.execute(
-            "UPDATE approvals SET args = ? WHERE approval_id = ?",
-            (json.dumps(data), approval_id))
-    conn.close()
+    gw.APPROVALS.db.execute(
+        "UPDATE approvals SET args = ? WHERE approval_id = ?",
+        (json.dumps(data), approval_id))
     response = client.post(f"/approvals/{approval_id}/resolve",
                            json={"choice": "allow_once"}, headers=ADMIN)
     assert response.status_code == 409
@@ -174,11 +159,9 @@ def test_missing_binding_fails_closed_for_legacy_record(client, tmp_path):
     import taskfence.gateway as gw
     record = gw.APPROVALS.get(approval_id)
     legacy = record["request"]  # FlowRequest snapshot only
-    conn = sqlite3.connect(tmp_path / "appr.db")
-    with conn:
-        conn.execute("UPDATE approvals SET args = ? WHERE approval_id = ?",
-                     (json.dumps(legacy), approval_id))
-    conn.close()
+    gw.APPROVALS.db.execute(
+        "UPDATE approvals SET args = ? WHERE approval_id = ?",
+        (json.dumps(legacy), approval_id))
     response = client.post(f"/approvals/{approval_id}/resolve",
                            json={"choice": "allow_once"}, headers=ADMIN)
     assert response.status_code == 409
@@ -257,9 +240,9 @@ def test_payload_string_nowhere_in_unauthenticated_endpoints(client):
 # --- 4. Dashboard approval preview (SQLite path) -----------------------------
 
 def test_dashboard_sqlite_preview_shows_exact_request(
-        client, tmp_path, monkeypatch):
+        client, gateway_db, monkeypatch):
     task_id, approval_id, args = _approve(client)
-    monkeypatch.setenv("TASKFENCE_DB", str(tmp_path / "appr.db"))
+    monkeypatch.setenv("TASKFENCE_DB", str(gateway_db.sqlite_path))
     import importlib
     import dashboard.app as dash
     importlib.reload(dash)
@@ -347,7 +330,8 @@ def test_expand_task_grants_only_declared_group_despite_session_taint(
     # forged newer current contract:
     detail = client.get(f"/approvals/{approval_id}", headers=ADMIN).json()
     assert contract["parent_contract_id"] == detail["contract_id"]
-    assert contract["parent_contract_id"] != gw.CONTRACTS[task_id].contract_id
+    assert contract["parent_contract_id"] != gw.TASKS.get_contract(
+        task_id).contract_id
 
 
 def test_expand_task_with_no_declared_group_fails_closed(
