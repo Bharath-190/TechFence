@@ -9,6 +9,10 @@ plus raw **args in the agent-supplied shape:
     "task_id": str,
     "source_asset": str | None,  # registry asset id resolved by the gateway
     "content": str,              # content the gateway decided may move
+    # Optional: bytes the gateway VERIFIED against an approval's content
+    # binding. Only the approval-replay path sets it, so a verified read
+    # cannot return different bytes than the ones the human approved.
+    "verified_content": str | None,
   }
 Sinks receive exactly one JSONL line per executed call.
 
@@ -58,22 +62,34 @@ def _post_real_slack(text: str) -> dict:
         return {"real_slack": f"error_{type(error).__name__}"}
 
 # tool name -> metadata (gateway resolves actions/destinations from this).
+# Each entry carries a side_effect_classification that categorises the
+# tool's external capability. Used by the gateway to enforce classification
+# invariants during approval creation and allow_once replay.
 TOOL_REGISTRY = {
     "read_file": {
         "action": "read", "destination": "",
         "is_external": False, "is_outbound": False,
+        "side_effect_classification": "read_only",
     },
     "query_customer_db": {
         "action": "query", "destination": "",
         "is_external": False, "is_outbound": False,
+        "side_effect_classification": "read_only",
     },
     "send_slack": {
         "action": "send_message", "destination": "sales_slack",
         "is_external": False, "is_outbound": True,
+        # This tool consults the single real-delivery connector
+        # (TASKFENCE_REAL_SLACK_WEBHOOK); approvals fingerprint that
+        # configuration so a replay cannot deliver through a connector
+        # configuration the human never reviewed (R1b).
+        "real_delivery": True,
+        "side_effect_classification": "external_delivery",
     },
     "post_external": {
         "action": "post_external", "destination": "external_api",
         "is_external": True, "is_outbound": True,
+        "side_effect_classification": "internal_sink",
     },
 }
 
@@ -87,14 +103,19 @@ def _append_line(sink: str, record: dict) -> None:
 
 def read_file(ctx: dict, **args) -> dict:
     asset_id = ctx["source_asset"]
-    content = registry.read_asset(asset_id)
+    # An approval replay passes the exact bytes it verified against the
+    # content binding, so it cannot return different bytes than the human
+    # approved; every other call reads the asset itself.
+    content = ctx.get("verified_content") or registry.read_asset(asset_id)
     return {"asset_id": asset_id, "path": str(args.get("path", "")),
             "content": content}
 
 
 def query_customer_db(ctx: dict, **args) -> dict:
     query = str(args.get("query", "")).strip().lower()
-    payload = json.loads(registry.read_asset("customer_db"))
+    # Same rule as read_file: use the approval-verified bytes when given.
+    content = ctx.get("verified_content") or registry.read_asset("customer_db")
+    payload = json.loads(content)
     customers = payload.get("customers", [])
     if not query:
         matches = customers

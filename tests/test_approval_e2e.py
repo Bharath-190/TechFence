@@ -12,21 +12,8 @@ ADMIN = {"X-Admin-Token": "devtoken"}
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(isolate_gateway, monkeypatch):
     monkeypatch.setenv("TASKFENCE_ADMIN_TOKEN", "devtoken")
-    monkeypatch.setattr(registry, "OUTBOX_DIR", tmp_path / "outbox")
-    import taskfence.gateway as gw
-    from taskfence.audit import AuditLog
-    from taskfence.lineage import LineageTracker
-    from taskfence.approvals import ApprovalStore
-    monkeypatch.setattr(gw, "TRACKER",
-                        LineageTracker(db_path=tmp_path / "lin.db"))
-    monkeypatch.setattr(gw, "AUDIT", AuditLog(tmp_path / "audit.db"))
-    monkeypatch.setattr(gw, "APPROVALS", ApprovalStore(tmp_path / "appr.db"))
-    from taskfence.audit import TaskStateStore
-    monkeypatch.setattr(gw, "STATE", TaskStateStore(tmp_path / "state.db"))
-    monkeypatch.setattr("taskfence.contract._ollama_chat",
-                        lambda task_text: None)
     registry.reset_outbox()
     with TestClient(app) as test_client:
         yield test_client

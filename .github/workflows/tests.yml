@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  deterministic:
+    name: Deterministic tier (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Deterministic tier
+        run: python -m pytest -q
+
+  postgres:
+    name: PostgreSQL integration tier
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: taskfence
+          POSTGRES_PASSWORD: taskfence
+          POSTGRES_DB: taskfence_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taskfence -d taskfence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TASKFENCE_TEST_DATABASE_URL: postgresql://taskfence:taskfence@127.0.0.1:5432/taskfence_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      # A requested tier that cannot run must FAIL here (exit 2/3), never
+      # skip and never pass (PHASE_2_READINESS §4.1).
+      - name: Preflight (fails when the database is missing or unreachable)
+        run: python scripts/postgres_preflight.py
+      - name: PostgreSQL tier
+        run: python -m pytest -m postgres_integration -q

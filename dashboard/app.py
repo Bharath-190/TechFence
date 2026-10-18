@@ -13,6 +13,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -20,9 +21,155 @@ import streamlit as st
 
 st.set_page_config(page_title="TaskFence", page_icon="🛡️", layout="wide")
 
-DB_PATH = Path(os.environ.get("TASKFENCE_DB", "taskfence.sqlite3"))
+from taskfence.config import load_config
+from taskfence.persistence import Persistence
+
+CONFIG = load_config()
+DB_PATH = Path(CONFIG.sqlite_path) if not CONFIG.use_postgres else None
+
+_BACKEND: Persistence | None = None
+_BACKEND_KEY: tuple | None = None
+
+
+def _backend() -> Persistence:
+    """Resolve the ONE configured backend for the current environment.
+
+    The gateway and this dashboard derive their backend from the same
+    `load_config()` snapshot (AD-21/AD-25), so a different working
+    directory cannot point them at different files. A configured
+    PostgreSQL backend is never replaced by SQLite when it is
+    unreachable: the display degrades instead (AD-05).
+    """
+    global _BACKEND, _BACKEND_KEY
+    config = load_config()
+    key = (config.use_postgres, str(config.sqlite_path),
+           config.database_url.reveal())
+    if _BACKEND is None or _BACKEND_KEY != key:
+        _BACKEND = Persistence(config)
+        _BACKEND_KEY = key
+    return _BACKEND
+
+
+def _db_available() -> bool:
+    """The dashboard reads the same configured backend as the gateway.
+
+    A PostgreSQL dashboard probes with a cheap query: an unreachable
+    backend degrades the display only — it never switches backends and
+    never affects authorization (AD-05).
+    """
+    config = load_config()
+    if config.use_postgres:
+        try:
+            _backend().db.query_one("SELECT 1 AS ok")
+            return True
+        except Exception:
+            return False
+    return bool(config.sqlite_path) and Path(config.sqlite_path).exists()
+
+
+class _Row:
+    """sqlite3.Row-shaped display row: int and column-name access."""
+
+    def __init__(self, data: dict):
+        self._data = dict(data)
+        self._values = list(self._data.values())
+
+    def __getitem__(self, key):
+        return self._values[key] if isinstance(key, int) else self._data[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def keys(self):
+        return self._data.keys()
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
+class _CursorAdapter:
+    def __init__(self, rows=None, rowcount=0):
+        self._rows = [_Row(r) if isinstance(r, dict) else _Row(
+            {str(i): v for i, v in enumerate(r)}) for r in (rows or [])]
+        self.rowcount = rowcount
+        names = list(self._rows[0].keys()) if self._rows else []
+        self.description = [(name, None, None, None, None, None, None)
+                            for name in names]
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _ConnectionAdapter:
+    """Display-only adapter over the shared Database (read + reset only)."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql: str, params=()):
+        try:
+            head = sql.lstrip().split(None, 1)[0].upper()
+            if head in ("SELECT", "PRAGMA", "WITH", "SHOW"):
+                return _CursorAdapter(rows=self._db.query(sql, params))
+            return _CursorAdapter(rowcount=self._db.execute(sql, params))
+        except Exception as error:  # display layer: keep the old UI contract
+            raise sqlite3.OperationalError(str(error)) from error
+
+    def close(self) -> None:
+        return None
 GATEWAY = os.environ.get("TASKFENCE_URL", "http://localhost:8000").rstrip("/")
 ADMIN_TOKEN = os.environ.get("TASKFENCE_ADMIN_TOKEN", "")
+# Phase 3 (G-04): when the gateway runs in JWT mode the two approval
+# endpoints require a verified bearer token IN ADDITION to the admin token.
+# The dashboard consumes one from this server-side variable; it never mints a
+# token, never verifies one, and never sends it to the browser (Streamlit
+# renders server-side and this value is only used in the httpx calls below).
+# See docs/implementation/PHASE_3_JWT_READINESS.md.
+REVIEWER_JWT = os.environ.get("TASKFENCE_REVIEWER_JWT", "")
+
+
+def _reviewer_headers() -> dict:
+    """Headers for the admin-gated approval endpoints.
+
+    The admin token authorizes; the reviewer JWT identifies. Both are sent
+    when configured, and the JWT is attached ONLY here — never rendered,
+    never logged, never passed to any browser-side code.
+    """
+    headers = {"X-Admin-Token": ADMIN_TOKEN}
+    if REVIEWER_JWT:
+        headers["Authorization"] = f"Bearer {REVIEWER_JWT}"
+    return headers
+
+
+def _auth_failure(action: str, status: int) -> None:
+    """Explain a refused privileged call without guessing at the cause."""
+    if status == 401:
+        st.error(
+            f"{action}: HTTP 401 — the gateway requires a verified JWT "
+            "(TASKFENCE_AUTH_MODE=jwt). Export TASKFENCE_REVIEWER_JWT for "
+            "this dashboard process with an access token issued by the "
+            "configured issuer/audience, then retry. See "
+            "docs/implementation/PHASE_3_JWT_READINESS.md.")
+    elif status == 403:
+        st.error(f"{action}: HTTP 403 — the admin token was rejected.")
+    else:
+        st.error(f"{action}: HTTP {status}")
+
 
 OUTCOME_COLOR = {"ALLOW": "#2e7d32", "BLOCK": "#c62828",
                  "APPROVE": "#f9a825"}
@@ -145,13 +292,12 @@ FINAL_COLOR = {
 }
 
 
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    return conn
+def _db():
+    return _ConnectionAdapter(_backend().db)
 
 
 def _latest_task_and_state() -> tuple[str | None, dict | None]:
-    if not DB_PATH.exists():
+    if not _db_available():
         return None, None
     conn = _db()
     try:
@@ -174,7 +320,7 @@ def _latest_audit_for_task(task_id: str | None) -> dict | None:
     """Most recent audit event for the latest task — verbatim stored flow
     fields (sources, labels, transformation, destination) for the decision
     panel. Read-only; the panel assembles display strings only."""
-    if not DB_PATH.exists():
+    if not _db_available():
         return None
     conn = _db()
     try:
@@ -219,12 +365,20 @@ def _system_status() -> None:
     if not healthy:
         st.caption("Start it: `TASKFENCE_ADMIN_TOKEN=devtoken .venv/bin/"
                    "uvicorn taskfence.gateway:app --port 8000`")
+    if CONFIG.jwt_enabled and not REVIEWER_JWT:
+        st.error(
+            "Gateway identity mode is JWT (TASKFENCE_AUTH_MODE=jwt) but this "
+            "dashboard has no reviewer token, so approval detail and "
+            "resolution will return 401. Export TASKFENCE_REVIEWER_JWT with "
+            "an access token from the configured issuer/audience. JWT mode "
+            "has no in-dashboard login flow yet (Phase 3 limitation) — see "
+            "docs/implementation/PHASE_3_JWT_READINESS.md.")
 
 
 def _task_audit_rows(task_id: str | None) -> list[dict]:
     """Every stored audit event of a task, verbatim, in decision order —
     the raw material for the SECURITY FLOW panel (real data only)."""
-    if not DB_PATH.exists():
+    if not _db_available():
         return []
     conn = _db()
     try:
@@ -372,7 +526,7 @@ def _running_scenario() -> tuple[bool, str]:
 def _approval_ids_by_task() -> dict[str, str]:
     """task_id -> approval_id map for the audit trail's approval column
     (display mapping from stored approvals; latest approval per task)."""
-    if not DB_PATH.exists():
+    if not _db_available():
         return {}
     conn = _db()
     try:
@@ -386,7 +540,7 @@ def _approval_ids_by_task() -> dict[str, str]:
 
 
 def _audit_events(decision_filter: str | None) -> list[dict]:
-    if not DB_PATH.exists():
+    if not _db_available():
         return []
     conn = _db()
     try:
@@ -416,16 +570,45 @@ def _audit_events(decision_filter: str | None) -> list[dict]:
         conn.close()
 
 
+def _approval_age(created_at: str) -> str:
+    """Human-readable age of a pending approval (R2).
+
+    Display only: the dashboard prints how long a request has been waiting so
+    a human can judge staleness before clicking Allow Once. No expiry is
+    enforced anywhere — that policy does not exist yet.
+    """
+    try:
+        created = datetime.fromisoformat(str(created_at))
+    except (TypeError, ValueError):
+        return "unknown age"
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    seconds = max(int((datetime.now(timezone.utc) - created).total_seconds()),
+                  0)
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} h ago"
+    days = seconds // 86400
+    return f"{days} day ago" if days == 1 else f"{days} days ago"
+
+
 def _pending_approvals() -> list[dict]:
-    if not DB_PATH.exists():
+    if not _db_available():
         return []
     conn = _db()
     try:
+        # R2: created_at is part of the pending card (age display), and the
+        # ordering is on stored columns so it works on SQLite and
+        # PostgreSQL alike (rowid does not exist on PostgreSQL).
+        columns = ["approval_id", "task_id", "tool", "reasons", "created_at"]
         rows = conn.execute(
-            "SELECT approval_id, task_id, tool, reasons FROM approvals"
-            " WHERE status = 'pending' ORDER BY rowid")
-        return [dict(zip(["approval_id", "task_id", "tool", "reasons"], row))
-                for row in rows.fetchall()]
+            "SELECT approval_id, task_id, tool, reasons, created_at"
+            " FROM approvals WHERE status = 'pending'"
+            " ORDER BY created_at, approval_id")
+        return [dict(zip(columns, row)) for row in rows.fetchall()]
     except sqlite3.OperationalError:
         return []
     finally:
@@ -439,7 +622,7 @@ def _approval_detail(approval_id: str) -> dict | None:
     human-side process: no HTTP token check is invented around this local
     read (kit FIX1-C). Full tool_args never leave this view; the generic
     unauthenticated gateway endpoints stay narrow."""
-    if not DB_PATH.exists():
+    if not _db_available():
         return None
     conn = _db()
     try:
@@ -542,10 +725,9 @@ def _audit_metrics() -> dict:
                "incomplete": 0, "tasks_without_events": 0}
     # Per-call path (like the report path) so env overrides apply even
     # when this module was imported earlier by a different process/test.
-    db_path = Path(os.environ.get("TASKFENCE_DB", "taskfence.sqlite3"))
-    if not db_path.exists():
+    if not _db_available():
         return metrics
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = _db()
     try:
         row = conn.execute(
             "SELECT COUNT(*), "
@@ -702,6 +884,12 @@ def live_panel():
             columns = st.columns([4, 1, 1, 1])
             columns[0].markdown(
                 f"**{approval['tool']}** — {approval['reasons'][:120]}")
+            # R2: age is visible before the human decides. Informational
+            # only — nothing expires automatically.
+            created = approval.get("created_at") or ""
+            columns[0].markdown(
+                f"Pending since `{created or 'unknown'}`"
+                f" ({_approval_age(created)})")
             if detail:
                 version = detail["contract_version"]
                 columns[0].markdown(
@@ -724,11 +912,11 @@ def _resolve(approval_id: str, choice: str) -> None:
         response = httpx.post(
             f"{GATEWAY}/approvals/{approval_id}/resolve",
             json={"choice": choice},
-            headers={"X-Admin-Token": ADMIN_TOKEN}, timeout=10)
+            headers=_reviewer_headers(), timeout=10)
         if response.status_code == 200:
             st.toast(f"Approval {choice}: done")
         else:
-            st.error(f"Resolve failed: HTTP {response.status_code}")
+            _auth_failure("Resolve failed", response.status_code)
     except httpx.HTTPError as error:
         st.error(f"Gateway unreachable: {error}")
 
@@ -767,12 +955,12 @@ def _fetch_approval_detail(approval_id: str) -> dict | None:
     try:
         response = httpx.get(
             f"{GATEWAY}/approvals/{approval_id}",
-            headers={"X-Admin-Token": ADMIN_TOKEN}, timeout=10)
+            headers=_reviewer_headers(), timeout=10)
     except httpx.HTTPError as error:
         st.error(f"Gateway unreachable: {error}")
         return None
     if response.status_code != 200:
-        st.error(f"Approval detail failed: HTTP {response.status_code}")
+        _auth_failure("Approval detail failed", response.status_code)
         return None
     return response.json()
 
@@ -784,12 +972,12 @@ def _resolve_allow_once(approval_id: str) -> dict | None:
         response = httpx.post(
             f"{GATEWAY}/approvals/{approval_id}/resolve",
             json={"choice": "allow_once"},
-            headers={"X-Admin-Token": ADMIN_TOKEN}, timeout=10)
+            headers=_reviewer_headers(), timeout=10)
     except httpx.HTTPError as error:
         st.error(f"Gateway unreachable: {error}")
         return None
     if response.status_code != 200:
-        st.error(f"Resolve failed: HTTP {response.status_code}")
+        _auth_failure("Resolve failed", response.status_code)
         return None
     st.toast("Approval allow_once: done")
     return response.json()
@@ -1022,21 +1210,37 @@ with st.sidebar:
                 st.session_state["last_scenario"] = "scenario_d"
                 st.toast(f"Scenario D request: {result['outcome']}")
     st.divider()
-    if st.button("♻️ Reset DB + outbox"):
-        conn = _db()
-        with conn:
-            for table in ("audit_events", "task_state", "approvals",
-                          "lineage_nodes", "lineage_edges"):
-                try:
-                    conn.execute(f"DELETE FROM {table}")
-                except sqlite3.OperationalError:
-                    pass
-        conn.close()
-        outbox = Path("outbox")
-        if outbox.exists():
-            for sink in outbox.glob("*.jsonl"):
-                sink.write_text("", encoding="utf-8")
-        st.toast("Reset complete")
+    # Destructive DEMO reset. Append-only decision history and monotonic
+    # taint are application guarantees (API surface + tests), not database
+    # permissions; this operator action is the only path that removes them,
+    # so it requires an explicit confirmation and deletes nothing otherwise.
+    st.caption("Destructive demo reset")
+    confirmed = st.checkbox(
+        "I understand this permanently deletes ALL demo data — tasks, "
+        "contracts, decisions, approvals, audit events, lineage and "
+        "session taint — and empties the outbox.")
+    if st.button("♻️ Reset DEMO data (destructive)"):
+        if not confirmed:
+            st.warning(
+                "Reset NOT performed: tick the confirmation box first. "
+                "Nothing was deleted.")
+        else:
+            conn = _db()
+            with conn:
+                for table in ("audit_events", "task_state", "approvals",
+                              "lineage_nodes", "lineage_edges",
+                              "task_decisions", "task_contracts",
+                              "task_reads", "tasks"):
+                    try:
+                        conn.execute(f"DELETE FROM {table}")
+                    except sqlite3.OperationalError:
+                        pass
+            conn.close()
+            outbox = Path("outbox")
+            if outbox.exists():
+                for sink in outbox.glob("*.jsonl"):
+                    sink.write_text("", encoding="utf-8")
+            st.toast("Demo data reset (operator-confirmed)")
 
 _decision_panel()
 

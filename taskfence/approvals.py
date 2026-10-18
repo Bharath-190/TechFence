@@ -1,72 +1,52 @@
-"""Human approval store (spec §16; DECISIONS §9; kit Prompts E1, E2; FIX1).
+"""Human approval store (Phase 2; FIX1; AD-25).
 
-SQLite-backed so the Streamlit dashboard — a separate process — can list
-pending approvals. Exposes only create/get/pending/set_status: no update of
-approval content, no delete. Resolution itself is audited by the gateway.
+Durable, backed by the single configured database. Resolution is an **atomic
+conditional claim**: exactly one resolver can move a record out of ``pending``,
+and the loser gets ``False`` rather than executing anything.
 
-FIX1 (approval record integrity):
-- The record stores the EXACT original tool-call arguments (`tool_args`),
-  separate from the FlowRequest policy snapshot used for evaluation/display.
-  The snapshot's payload may be truncated; replay must never use it.
-- The record is bound to the reviewed contract: `contract_id` +
-  `contract_version` plus a frozen `contract_snapshot` (TaskContract dump),
-  because the repository keeps no historical contract store — resolution
-  verifies against the snapshot and fails closed if it is gone or mismatched.
-- `declared_source_assets` records the ORIGINAL declared sources of the
-  request, so scope expansion grants only what was declared (never
-  session-taint groups).
-- Full tool_args are admin-only sensitive state (DECISIONS §10): `pending()`
-  keeps its narrow five-column projection and must never expose them.
+FIX1 record integrity is unchanged:
+- the exact original ``tool_args`` are stored separately from the truncated
+  policy snapshot;
+- the reviewed contract id/version/snapshot are stored with the record;
+- declared source assets are stored so scope expansion grants only what was
+  declared, never session taint.
 """
 
+from __future__ import annotations
+
 import json
-import sqlite3
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 
-DEFAULT_DB_PATH = Path("taskfence.sqlite3")
+from taskfence.persistence import Database, coerce_database, now_iso
 
-_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS approvals ("
-    " approval_id TEXT PRIMARY KEY,"
-    " task_id TEXT NOT NULL,"
-    " tool TEXT NOT NULL,"
-    " args TEXT NOT NULL,"
-    " reasons TEXT NOT NULL,"
-    " status TEXT NOT NULL,"
-    " created_at TEXT NOT NULL,"
-    " resolved_at TEXT NULL)"
-)
-
-# Narrow projection for unauthenticated listing (GET /approvals, task state).
-# Do NOT widen: these rows leave the admin boundary.
+# Narrow projection for unauthenticated listing. Do NOT widen.
 _PENDING_COLUMNS = ("approval_id", "task_id", "tool", "reasons", "created_at")
 
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# The only states a resolution claim may move a record to (F4). Anything
+# else is a programming error, not a status write: there is deliberately no
+# unconditional setter, so no caller can bypass the pending-state claim.
+RESOLUTION_STATUSES = ("allowed_once", "denied", "expanded")
 
 
 class ApprovalStore:
-    def __init__(self, db_path: Path | str = DEFAULT_DB_PATH):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        with self.conn:
-            self.conn.execute(_SCHEMA)
+    def close(self) -> None:
+        """Legacy lifecycle hook: connections are per operation now."""
+        return None
+    def __init__(self, db: Database | str | None = None):
+        self.db = coerce_database(db)
 
     def create(self, task_id: str, tool: str, request_snapshot: dict,
                tool_args: dict, contract, declared_source_assets: list[str],
                declared_source_groups: list[str],
-               reasons: list[str]) -> str:
+               reasons: list[str], *, tool_binding: dict | None = None,
+               asset_binding: dict | None = None) -> str:
         """Create a pending approval.
 
-        request_snapshot: FlowRequest model_dump() — the policy/eval snapshot
-          (payload may be truncated; never used for replay).
-        tool_args: the EXACT original tool-call arguments (full payload).
-        contract: the reviewed TaskContract (id + version + frozen snapshot).
-        declared_source_assets: the request's declared source asset ids.
-        declared_source_groups: gateway-resolved groups of the DECLARED
-          assets only (display/expand scope; never session-taint groups).
+        ``tool_binding`` records the tool identity/action/destination and the
+        connector configuration the human reviewed (R1b); ``asset_binding``
+        records the content digest and classification of an approved read
+        (R3). Both are verified at replay and absent on pre-R1/R3 records,
+        where replay fails closed and asks for re-review.
         """
         approval_id = f"apr-{uuid.uuid4().hex[:12]}"
         args_payload = {
@@ -77,39 +57,29 @@ class ApprovalStore:
             "contract_snapshot": contract.model_dump(),
             "declared_source_assets": sorted(declared_source_assets),
             "declared_source_groups": sorted(declared_source_groups),
+            "tool_binding": tool_binding,
+            "asset_binding": asset_binding,
         }
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO approvals (approval_id, task_id, tool, args,"
-                " reasons, status, created_at, resolved_at)"
-                " VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)",
-                (approval_id, task_id, tool, json.dumps(args_payload),
-                 " || ".join(reasons), _now()))
+        self.db.execute(
+            "INSERT INTO approvals (approval_id, task_id, tool, args,"
+            " reasons, status, created_at, resolved_at, resolved_by)"
+            " VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
+            (approval_id, task_id, tool, json.dumps(args_payload),
+             " || ".join(reasons), now_iso()))
         return approval_id
 
     def get(self, approval_id: str) -> dict | None:
-        row = self.conn.execute(
+        row = self.db.query_one(
             "SELECT approval_id, task_id, tool, args, reasons, status,"
-            " created_at, resolved_at FROM approvals WHERE approval_id = ?",
-            (approval_id,)).fetchone()
+            " created_at, resolved_at, resolved_by FROM approvals"
+            " WHERE approval_id = ?", (approval_id,))
         if row is None:
             return None
-        names = ["approval_id", "task_id", "tool", "args", "reasons",
-                 "status", "created_at", "resolved_at"]
-        record = dict(zip(names, row))
-        record.update(self._parse_args(json.loads(record["args"])))
-        return record
+        row.update(self._parse_args(json.loads(row["args"])))
+        return row
 
     @staticmethod
     def _parse_args(raw: dict) -> dict:
-        """Normalize an approval's args payload.
-
-        FIX1 records carry `request` (policy snapshot), `tool_args`, the
-        reviewed contract id/version/snapshot, and declared source assets.
-        Pre-FIX1 rows store a bare FlowRequest dump; they are surfaced as a
-        request-only record without binding data, so resolution fails closed
-        (kit FIX1-A: never silently fall back).
-        """
         if "request" in raw:
             tool_args = raw.get("tool_args")
             return {
@@ -122,11 +92,14 @@ class ApprovalStore:
                     raw.get("declared_source_assets") or []),
                 "declared_source_groups": list(
                     raw.get("declared_source_groups") or []),
+                "tool_binding": raw.get("tool_binding"),
+                "asset_binding": raw.get("asset_binding"),
             }
-        # Legacy row: treat the whole payload as the request snapshot.
         return {
             "request": raw,
             "tool_args": None,
+            "tool_binding": None,
+            "asset_binding": None,
             "contract_id": "",
             "contract_version": "",
             "contract_snapshot": None,
@@ -135,24 +108,32 @@ class ApprovalStore:
         }
 
     def pending(self, task_id: str | None = None) -> list[dict]:
+        columns = ", ".join(_PENDING_COLUMNS)
         if task_id is None:
-            rows = self.conn.execute(
-                f"SELECT {', '.join(_PENDING_COLUMNS)} FROM approvals"
-                " WHERE status = 'pending' ORDER BY rowid")
-        else:
-            rows = self.conn.execute(
-                f"SELECT {', '.join(_PENDING_COLUMNS)} FROM approvals"
-                " WHERE status = 'pending' AND task_id = ?"
-                " ORDER BY rowid", (task_id,))
-        return [dict(zip(_PENDING_COLUMNS, row)) for row in rows.fetchall()]
+            return self.db.query(
+                f"SELECT {columns} FROM approvals"
+                " WHERE status = 'pending' ORDER BY created_at, approval_id")
+        return self.db.query(
+            f"SELECT {columns} FROM approvals"
+            " WHERE status = 'pending' AND task_id = ?"
+            " ORDER BY created_at, approval_id", (task_id,))
 
-    def set_status(self, approval_id: str, status: str) -> bool:
-        with self.conn:
-            cur = self.conn.execute(
-                "UPDATE approvals SET status = ?, resolved_at = ?"
-                " WHERE approval_id = ?",
-                (status, _now(), approval_id))
-        return cur.rowcount == 1
+    def claim(self, approval_id: str, status: str = "allowed_once",
+              resolved_by: str | None = None) -> bool:
+        """Atomically move a pending approval to ``status``.
 
-    def close(self) -> None:
-        self.conn.close()
+        Returns True for the single winner, False for every other attempt
+        (lost race, unknown id, or already resolved). Conditional on the
+        current status, so two resolvers cannot both succeed. ``status``
+        must be a resolution outcome; an unknown value raises before any
+        write, so a claim can never be used as a generic status setter.
+        """
+        if status not in RESOLUTION_STATUSES:
+            raise ValueError(
+                f"approval claim status must be one of {RESOLUTION_STATUSES},"
+                f" got {status!r}")
+        changed = self.db.execute(
+            "UPDATE approvals SET status = ?, resolved_at = ?,"
+            " resolved_by = ? WHERE approval_id = ? AND status = 'pending'",
+            (status, now_iso(), resolved_by, approval_id))
+        return changed == 1
